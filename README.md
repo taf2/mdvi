@@ -10,6 +10,7 @@ It renders markdown into a polished full-screen TUI with fast keyboard navigatio
 
 - Full-screen terminal viewer (`crossterm` + `ratatui`)
 - Vim-style navigation controls
+- Visible cursor and `line:column` cursor position in the status bar
 - High-quality markdown rendering via `pulldown-cmark`
 - Support for:
   - headings

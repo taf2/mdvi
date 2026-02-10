@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-02-10
+
+### Added
+- Visible in-document cursor with `line:column` cursor position in the status bar for easier eye tracking.
+
 ## [0.3.0] - 2026-02-10
 
 ### Added

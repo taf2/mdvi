@@ -26,6 +26,7 @@ use ratatui_image::{
     Resize, StatefulImage,
 };
 use regex::{Regex, RegexBuilder};
+use unicode_width::UnicodeWidthStr;
 
 use crate::{
     renderer::{read_markdown_file, render_markdown, RenderedDoc},
@@ -66,6 +67,7 @@ struct ImageRenderPlan {
 struct DisplayDoc {
     lines: Vec<Line<'static>>,
     image_plans: Vec<ImageRenderPlan>,
+    doc_line_for_row: Vec<usize>,
 }
 
 enum ResolvedImageSource {
@@ -337,9 +339,11 @@ impl App {
         let source_lines = self.highlighted_lines();
         let mut lines: Vec<Line<'static>> = Vec::with_capacity(source_lines.len());
         let mut image_plans = Vec::new();
+        let mut doc_line_for_row: Vec<usize> = Vec::with_capacity(source_lines.len());
 
         for (line_index, line) in source_lines.into_iter().enumerate() {
             lines.push(line);
+            doc_line_for_row.push(line_index);
 
             if let Some(image_index) = self.image_index_by_line.get(&line_index).copied() {
                 let height = self.image_height_for(&self.images[image_index], content_width);
@@ -347,6 +351,7 @@ impl App {
                     let start_row = lines.len();
                     for _ in 0..height {
                         lines.push(Line::default());
+                        doc_line_for_row.push(line_index);
                     }
                     image_plans.push(ImageRenderPlan {
                         image_index,
@@ -357,7 +362,11 @@ impl App {
             }
         }
 
-        DisplayDoc { lines, image_plans }
+        DisplayDoc {
+            lines,
+            image_plans,
+            doc_line_for_row,
+        }
     }
 }
 
@@ -417,9 +426,29 @@ pub fn run(file_path: PathBuf, start_line: usize, image_protocol: ImageProtocol)
                 let viewport_height = usize::from(content_inner.height);
                 let display_doc = app.build_display_doc(content_width);
                 let total_rows = display_doc.lines.len().max(1);
+                let total_doc_lines = app.doc.lines.len().max(1);
                 app.scroll = app
                     .scroll
                     .min(app.max_scroll(viewport_height, content_width));
+
+                let cursor_virtual_row = if viewport_height == 0 {
+                    app.scroll.min(total_rows.saturating_sub(1))
+                } else {
+                    let preferred_cursor_screen_row =
+                        (viewport_height / 2).min(viewport_height.saturating_sub(1));
+                    let max_visible_screen_row = total_rows
+                        .saturating_sub(1)
+                        .saturating_sub(app.scroll)
+                        .min(viewport_height.saturating_sub(1));
+                    app.scroll
+                        .saturating_add(preferred_cursor_screen_row.min(max_visible_screen_row))
+                };
+                let cursor_doc_line = display_doc
+                    .doc_line_for_row
+                    .get(cursor_virtual_row)
+                    .copied()
+                    .unwrap_or_else(|| app.doc.lines.len().saturating_sub(1));
+                let cursor_screen_row = cursor_virtual_row.saturating_sub(app.scroll);
 
                 let text = Text::from(display_doc.lines.clone());
                 let paragraph = Paragraph::new(text)
@@ -464,10 +493,12 @@ pub fn run(file_path: PathBuf, start_line: usize, image_protocol: ImageProtocol)
                     match &app.mode {
                         Mode::Normal => {
                             let mut right = format!(
-                                "{}  |  row {} / {}  |  ? help",
+                                "{}  |  row {} / {}  |  cursor {}:{}  |  ? help",
                                 app.status,
                                 app.scroll.saturating_add(1).min(total_rows),
-                                total_rows
+                                total_rows,
+                                cursor_doc_line.saturating_add(1).min(total_doc_lines),
+                                1
                             );
                             if !app.search_matches.is_empty() {
                                 right.push_str(&format!(
@@ -487,6 +518,26 @@ pub fn run(file_path: PathBuf, start_line: usize, image_protocol: ImageProtocol)
                     Style::default().add_modifier(Modifier::DIM),
                 )]);
                 frame.render_widget(Paragraph::new(status_line), chunks[1]);
+
+                match &app.mode {
+                    Mode::SearchInput(query) => {
+                        let max_x = chunks[1]
+                            .x
+                            .saturating_add(chunks[1].width.saturating_sub(1));
+                        let cursor_x = chunks[1]
+                            .x
+                            .saturating_add(1 + query.as_str().width() as u16)
+                            .min(max_x);
+                        frame.set_cursor_position((cursor_x, chunks[1].y));
+                    }
+                    Mode::Normal => {
+                        if viewport_height > 0 && content_inner.width > 0 {
+                            let cursor_y =
+                                content_inner.y.saturating_add(cursor_screen_row as u16);
+                            frame.set_cursor_position((content_inner.x, cursor_y));
+                        }
+                    }
+                }
             })?;
             should_redraw = false;
         }
