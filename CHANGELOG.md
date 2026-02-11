@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-02-11
+
+### Added
+- Less-style half-page navigation aliases: `d` (down) and `u` (up), in addition to `Ctrl-d` / `Ctrl-u` (issue #1).
+
 ## [0.5.0] - 2026-02-10
 
 ### Added

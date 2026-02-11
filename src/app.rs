@@ -636,7 +636,7 @@ pub fn run(file_path: PathBuf, start_line: usize, image_protocol: ImageProtocol)
                 }
 
                 let status = if app.show_help {
-                    "q quit | j/k move | g/G top/bottom | Ctrl-d/u half-page | Ctrl-f/b page | / search | n/N next/prev | r reload | ? help"
+                    "q quit | j/k move | g/G top/bottom | d/u,Ctrl-d/u half-page | Ctrl-f/b page | / search | n/N next/prev | r reload | ? help"
                         .to_string()
                 } else {
                     match &app.mode {
@@ -826,7 +826,15 @@ fn handle_key_event(
             app.scroll_down(half_page, viewport_height, content_width);
             false
         }
+        (KeyCode::Char('d'), KeyModifiers::NONE) => {
+            app.scroll_down(half_page, viewport_height, content_width);
+            false
+        }
         (KeyCode::Char('u'), KeyModifiers::CONTROL) => {
+            app.scroll_up(half_page);
+            false
+        }
+        (KeyCode::Char('u'), KeyModifiers::NONE) => {
             app.scroll_up(half_page);
             false
         }
@@ -1042,6 +1050,34 @@ mod tests {
         let _ = handle_key_event(
             &mut app,
             KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL),
+            viewport_height,
+            80,
+            half_page,
+            full_page,
+        );
+        assert_eq!(app.scroll, 0);
+    }
+
+    #[test]
+    fn d_and_u_scroll_half_page_without_ctrl() {
+        let mut app = test_app(200);
+        let viewport_height = 20;
+        let full_page = 20;
+        let half_page = 10;
+
+        let _ = handle_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+            viewport_height,
+            80,
+            half_page,
+            full_page,
+        );
+        assert_eq!(app.scroll, 10);
+
+        let _ = handle_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE),
             viewport_height,
             80,
             half_page,

@@ -71,6 +71,8 @@ mdvi --image-protocol halfblocks README.md
 
 - `j` / `Down`: scroll down one line
 - `k` / `Up`: scroll up one line
+- `d`: half-page down (less-style)
+- `u`: half-page up (less-style)
 - `Ctrl-d`: half-page down
 - `Ctrl-u`: half-page up
 - `PageDown`: full-page down
