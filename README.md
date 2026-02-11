@@ -4,7 +4,7 @@
 
 It renders markdown into a polished full-screen TUI with fast keyboard navigation, clear typography, and predictable behavior for large files.
 
-<img width="1712" height="1040" alt="Screenshot 2026-02-10 at 4 23 29 PM" src="https://github.com/user-attachments/assets/7e6fe27f-2308-4e92-9ba6-72587a2f0d2f" />
+<img width="1595" height="582" alt="Screenshot 2026-02-10 at 4 58 34 PM" src="https://github.com/user-attachments/assets/1b2da7a1-b5fb-4169-9d10-bcd97a07ae45" />
 
 ## Features
 
