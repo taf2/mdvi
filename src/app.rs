@@ -2,6 +2,8 @@ use std::{
     collections::BTreeMap,
     io::{self, Stdout},
     path::{Path, PathBuf},
+    sync::mpsc::{self, Receiver, Sender},
+    thread,
     time::Duration,
 };
 
@@ -17,7 +19,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, Paragraph, Wrap},
     Terminal,
 };
 use ratatui_image::{
@@ -34,6 +36,8 @@ use crate::{
 };
 
 type AppTerminal = Terminal<CrosstermBackend<Stdout>>;
+const DEFAULT_IMAGE_HINT_PIXEL_SIZE: (u32, u32) = (900, 500);
+const IMAGE_PRELOAD_VIEWPORTS: usize = 2;
 
 struct App {
     file_path: PathBuf,
@@ -50,12 +54,17 @@ struct App {
     search_regex: Option<Regex>,
     search_matches: Vec<usize>,
     active_match: usize,
+    image_loader_tx: Sender<ImageLoadRequest>,
+    image_loader_rx: Receiver<ImageLoadResult>,
 }
 
 struct InlineImage {
     line_index: usize,
+    source: Option<ResolvedImageSource>,
     state: Option<StatefulProtocol>,
     pixel_size: Option<(u32, u32)>,
+    hinted_pixel_size: Option<(u32, u32)>,
+    load_state: ImageLoadState,
 }
 
 struct ImageRenderPlan {
@@ -70,9 +79,30 @@ struct DisplayDoc {
     doc_line_for_row: Vec<usize>,
 }
 
+#[derive(Debug, Clone)]
 enum ResolvedImageSource {
     Local(PathBuf),
     Remote(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImageLoadState {
+    NotRequested,
+    Loading,
+    Loaded,
+    Failed,
+}
+
+#[derive(Debug, Clone)]
+struct ImageLoadRequest {
+    image_index: usize,
+    source: ResolvedImageSource,
+}
+
+#[derive(Debug)]
+struct ImageLoadResult {
+    image_index: usize,
+    dynamic_image: Option<image::DynamicImage>,
 }
 
 #[derive(Debug, Default)]
@@ -84,28 +114,24 @@ enum Mode {
 
 impl App {
     fn new(file_path: PathBuf, start_line: usize, picker: Picker) -> Result<Self> {
+        let (image_loader_tx, image_loader_rx) = start_image_loader_thread();
         let file_content = read_markdown_file(&file_path)?;
         let doc = render_markdown(&file_content)?;
-        let images = load_images_for_doc(&file_path, &doc, &picker);
+        let images = prepare_images_for_doc(&file_path, &doc);
         let image_index_by_line = images
             .iter()
             .enumerate()
             .map(|(idx, image)| (image.line_index, idx))
             .collect::<BTreeMap<usize, usize>>();
-        let loaded_images = images.iter().filter(|image| image.state.is_some()).count();
-        let image_failures = images.len().saturating_sub(loaded_images);
 
         let scroll = start_line.saturating_sub(1);
         let status = if images.is_empty() {
             format!("{} lines", doc.lines.len())
-        } else if image_failures == 0 {
-            format!("{} lines, {} images", doc.lines.len(), loaded_images)
         } else {
             format!(
-                "{} lines, {} images ({} failed)",
+                "{} lines, {} images (lazy load)",
                 doc.lines.len(),
-                loaded_images,
-                image_failures
+                images.len()
             )
         };
 
@@ -124,6 +150,8 @@ impl App {
             search_regex: None,
             search_matches: Vec::new(),
             active_match: 0,
+            image_loader_tx,
+            image_loader_rx,
         })
     }
 
@@ -133,9 +161,12 @@ impl App {
             Ok((content, doc))
         }) {
             Ok((content, doc)) => {
+                let (image_loader_tx, image_loader_rx) = start_image_loader_thread();
                 self.file_content = content;
                 self.doc = doc;
-                self.images = load_images_for_doc(&self.file_path, &self.doc, &self.picker);
+                self.images = prepare_images_for_doc(&self.file_path, &self.doc);
+                self.image_loader_tx = image_loader_tx;
+                self.image_loader_rx = image_loader_rx;
                 self.image_index_by_line = self
                     .images
                     .iter()
@@ -145,23 +176,13 @@ impl App {
                 if self.search_regex.is_some() {
                     self.rebuild_search_matches();
                 }
-                let loaded_images = self
-                    .images
-                    .iter()
-                    .filter(|image| image.state.is_some())
-                    .count();
-                let image_failures = self.images.len().saturating_sub(loaded_images);
                 self.status = if self.images.is_empty() {
                     format!("reloaded {}", self.file_path.display())
-                } else if image_failures == 0 {
-                    format!(
-                        "reloaded {} ({loaded_images} images)",
-                        self.file_path.display()
-                    )
                 } else {
                     format!(
-                        "reloaded {} ({loaded_images} images, {image_failures} failed)",
-                        self.file_path.display()
+                        "reloaded {} ({} images, lazy load)",
+                        self.file_path.display(),
+                        self.images.len()
                     )
                 };
             }
@@ -309,13 +330,23 @@ impl App {
         row
     }
 
+    fn effective_image_pixel_size(&self, image: &InlineImage) -> Option<(u32, u32)> {
+        if let Some(pixel_size) = image.pixel_size {
+            return Some(pixel_size);
+        }
+        if let Some(hinted_pixel_size) = image.hinted_pixel_size {
+            return Some(hinted_pixel_size);
+        }
+        if image.load_state == ImageLoadState::Failed {
+            return None;
+        }
+        Some(DEFAULT_IMAGE_HINT_PIXEL_SIZE)
+    }
+
     fn image_height_for(&self, image: &InlineImage, content_width: u16) -> usize {
         const MAX_IMAGE_CELL_HEIGHT: usize = 18;
 
-        if image.state.is_none() {
-            return 0;
-        }
-        let Some((pixel_width, pixel_height)) = image.pixel_size else {
+        let Some((pixel_width, pixel_height)) = self.effective_image_pixel_size(image) else {
             return 0;
         };
         if pixel_width == 0 || pixel_height == 0 || content_width == 0 {
@@ -333,6 +364,87 @@ impl App {
         let height_cells = target_pixel_height.div_ceil(font_height).max(1) as usize;
 
         height_cells.min(MAX_IMAGE_CELL_HEIGHT)
+    }
+
+    fn image_progress_counts(&self) -> (usize, usize, usize) {
+        let mut loaded = 0usize;
+        let mut loading = 0usize;
+        let mut failed = 0usize;
+
+        for image in &self.images {
+            match image.load_state {
+                ImageLoadState::Loaded => loaded += 1,
+                ImageLoadState::Loading => loading += 1,
+                ImageLoadState::Failed => failed += 1,
+                ImageLoadState::NotRequested => {}
+            }
+        }
+
+        (loaded, loading, failed)
+    }
+
+    fn request_image_load(&mut self, image_index: usize) {
+        let Some(image) = self.images.get_mut(image_index) else {
+            return;
+        };
+        if image.load_state != ImageLoadState::NotRequested {
+            return;
+        }
+
+        let Some(source) = image.source.clone() else {
+            image.load_state = ImageLoadState::Failed;
+            return;
+        };
+
+        if self
+            .image_loader_tx
+            .send(ImageLoadRequest {
+                image_index,
+                source,
+            })
+            .is_ok()
+        {
+            image.load_state = ImageLoadState::Loading;
+        } else {
+            image.load_state = ImageLoadState::Failed;
+        }
+    }
+
+    fn request_images_near_viewport(&mut self, display_doc: &DisplayDoc, viewport_height: usize) {
+        let preload_rows = viewport_height.saturating_mul(IMAGE_PRELOAD_VIEWPORTS);
+        let preload_top = self.scroll.saturating_sub(preload_rows);
+        let preload_bottom = self
+            .scroll
+            .saturating_add(viewport_height)
+            .saturating_add(preload_rows);
+
+        for plan in &display_doc.image_plans {
+            let end_row = plan.start_row.saturating_add(plan.height);
+            if end_row < preload_top || plan.start_row > preload_bottom {
+                continue;
+            }
+            self.request_image_load(plan.image_index);
+        }
+    }
+
+    fn drain_image_results(&mut self) -> bool {
+        let mut changed = false;
+        while let Ok(result) = self.image_loader_rx.try_recv() {
+            let Some(image) = self.images.get_mut(result.image_index) else {
+                continue;
+            };
+
+            if let Some(dynamic_image) = result.dynamic_image {
+                image.pixel_size = Some((dynamic_image.width(), dynamic_image.height()));
+                image.state = Some(self.picker.new_resize_protocol(dynamic_image));
+                image.load_state = ImageLoadState::Loaded;
+            } else {
+                image.load_state = ImageLoadState::Failed;
+            }
+
+            changed = true;
+        }
+        changed
     }
 
     fn build_display_doc(&self, content_width: u16) -> DisplayDoc {
@@ -409,6 +521,10 @@ pub fn run(file_path: PathBuf, start_line: usize, image_protocol: ImageProtocol)
     let mut should_redraw = true;
 
     loop {
+        if app.drain_image_results() {
+            should_redraw = true;
+        }
+
         if should_redraw {
             let terminal = tui.terminal_mut();
             terminal.draw(|frame| {
@@ -430,6 +546,7 @@ pub fn run(file_path: PathBuf, start_line: usize, image_protocol: ImageProtocol)
                 app.scroll = app
                     .scroll
                     .min(app.max_scroll(viewport_height, content_width));
+                app.request_images_near_viewport(&display_doc, viewport_height);
 
                 let cursor_virtual_row = if viewport_height == 0 {
                     app.scroll.min(total_rows.saturating_sub(1))
@@ -459,30 +576,62 @@ pub fn run(file_path: PathBuf, start_line: usize, image_protocol: ImageProtocol)
                 frame.render_widget(paragraph, chunks[0]);
 
                 for plan in &display_doc.image_plans {
-                    if plan.start_row < app.scroll
-                        || plan.start_row.saturating_add(plan.height)
-                            > app.scroll.saturating_add(viewport_height)
-                    {
+                    let plan_top = plan.start_row;
+                    let plan_bottom = plan.start_row.saturating_add(plan.height);
+                    let view_top = app.scroll;
+                    let view_bottom = app.scroll.saturating_add(viewport_height);
+
+                    if plan_bottom <= view_top || plan_top >= view_bottom {
                         continue;
                     }
+                    let visible_top = plan_top.max(view_top);
+                    let visible_bottom = plan_bottom.min(view_bottom);
+                    let visible_height = visible_bottom.saturating_sub(visible_top);
+                    if visible_height == 0 {
+                        continue;
+                    }
+                    let is_fully_visible = plan_top >= view_top && plan_bottom <= view_bottom;
+
                     let image_y = content_inner
                         .y
-                        .saturating_add((plan.start_row - app.scroll) as u16);
+                        .saturating_add((visible_top - view_top) as u16);
                     let image_area = Rect::new(
                         content_inner.x,
                         image_y,
                         content_inner.width,
-                        plan.height as u16,
+                        visible_height as u16,
                     );
                     if image_area.width == 0 || image_area.height == 0 {
                         continue;
                     }
-                    if let Some(image_state) = app.images[plan.image_index].state.as_mut() {
-                        frame.render_stateful_widget(
-                            StatefulImage::default().resize(Resize::Fit(None)),
-                            image_area,
-                            image_state,
-                        );
+                    frame.render_widget(Clear, image_area);
+                    // Rendering partially visible images causes repeated re-encoding with shrinking
+                    // target heights while scrolling. That produces visible width distortion and
+                    // choppy movement, so only draw loaded images when fully visible.
+                    if is_fully_visible {
+                        if let Some(image_state) = app.images[plan.image_index].state.as_mut() {
+                            frame.render_stateful_widget(
+                                StatefulImage::default().resize(Resize::Fit(None)),
+                                image_area,
+                                image_state,
+                            );
+                        }
+                    } else if app.images[plan.image_index].state.is_none() {
+                        let placeholder = match app.images[plan.image_index].load_state {
+                            ImageLoadState::Loading => "[loading image...]",
+                            ImageLoadState::Failed => "[image unavailable]",
+                            ImageLoadState::NotRequested => "[image pending]",
+                            ImageLoadState::Loaded => "",
+                        };
+                        if !placeholder.is_empty() {
+                            frame.render_widget(
+                                Paragraph::new(Line::from(Span::styled(
+                                    format!("  {placeholder}"),
+                                    Style::default().add_modifier(Modifier::DIM),
+                                ))),
+                                image_area,
+                            );
+                        }
                     }
                 }
 
@@ -492,6 +641,8 @@ pub fn run(file_path: PathBuf, start_line: usize, image_protocol: ImageProtocol)
                 } else {
                     match &app.mode {
                         Mode::Normal => {
+                            let (loaded_images, loading_images, failed_images) =
+                                app.image_progress_counts();
                             let mut right = format!(
                                 "{}  |  row {} / {}  |  cursor {}:{}  |  ? help",
                                 app.status,
@@ -500,6 +651,12 @@ pub fn run(file_path: PathBuf, start_line: usize, image_protocol: ImageProtocol)
                                 cursor_doc_line.saturating_add(1).min(total_doc_lines),
                                 1
                             );
+                            if !app.images.is_empty() {
+                                right.push_str(&format!(
+                                    "  |  images {loaded_images}/{}, loading {loading_images}, failed {failed_images}",
+                                    app.images.len()
+                                ));
+                            }
                             if !app.search_matches.is_empty() {
                                 right.push_str(&format!(
                                     "  |  match {} / {}",
@@ -542,7 +699,7 @@ pub fn run(file_path: PathBuf, start_line: usize, image_protocol: ImageProtocol)
             should_redraw = false;
         }
 
-        if !event::poll(Duration::from_millis(250))? {
+        if !event::poll(Duration::from_millis(80))? {
             continue;
         }
 
@@ -685,62 +842,84 @@ fn handle_key_event(
     }
 }
 
-fn load_images_for_doc(
-    markdown_path: &Path,
-    doc: &RenderedDoc,
-    picker: &Picker,
-) -> Vec<InlineImage> {
+fn prepare_images_for_doc(markdown_path: &Path, doc: &RenderedDoc) -> Vec<InlineImage> {
+    doc.images
+        .iter()
+        .map(|image| {
+            let source = resolve_image_source(markdown_path, &image.src);
+            let mut hinted_pixel_size = image.hinted_pixel_size;
+
+            if hinted_pixel_size.is_none() {
+                if let Some(ResolvedImageSource::Local(path)) = source.as_ref() {
+                    if let Ok(reader) = ImageReader::open(path) {
+                        hinted_pixel_size = reader.into_dimensions().ok();
+                    }
+                }
+            }
+
+            let load_state = if source.is_some() {
+                ImageLoadState::NotRequested
+            } else {
+                ImageLoadState::Failed
+            };
+
+            InlineImage {
+                line_index: image.line_index,
+                source,
+                state: None,
+                pixel_size: None,
+                hinted_pixel_size,
+                load_state,
+            }
+        })
+        .collect()
+}
+
+fn start_image_loader_thread() -> (Sender<ImageLoadRequest>, Receiver<ImageLoadResult>) {
+    let (request_tx, request_rx) = mpsc::channel::<ImageLoadRequest>();
+    let (result_tx, result_rx) = mpsc::channel::<ImageLoadResult>();
+
+    let _ = thread::Builder::new()
+        .name("mdvi-image-loader".to_string())
+        .spawn(move || image_loader_worker(request_rx, result_tx));
+
+    (request_tx, result_rx)
+}
+
+fn image_loader_worker(request_rx: Receiver<ImageLoadRequest>, result_tx: Sender<ImageLoadResult>) {
     let remote_client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(15))
         .user_agent(format!("mdvi/{}", env!("CARGO_PKG_VERSION")))
         .build()
         .ok();
 
-    doc.images
-        .iter()
-        .map(|image| {
-            let mut inline = InlineImage {
-                line_index: image.line_index,
-                state: None,
-                pixel_size: None,
-            };
+    while let Ok(request) = request_rx.recv() {
+        let dynamic_image = load_dynamic_image(&request.source, remote_client.as_ref());
+        if result_tx
+            .send(ImageLoadResult {
+                image_index: request.image_index,
+                dynamic_image,
+            })
+            .is_err()
+        {
+            break;
+        }
+    }
+}
 
-            let Some(source) = resolve_image_source(markdown_path, &image.src) else {
-                return inline;
-            };
-
-            match source {
-                ResolvedImageSource::Local(path) => {
-                    if let Ok(reader) = ImageReader::open(&path) {
-                        if let Ok(dynamic_image) = reader.decode() {
-                            inline.pixel_size =
-                                Some((dynamic_image.width(), dynamic_image.height()));
-                            inline.state = Some(picker.new_resize_protocol(dynamic_image));
-                        }
-                    }
-                }
-                ResolvedImageSource::Remote(url) => {
-                    if let Some(client) = &remote_client {
-                        if let Ok(response) = client
-                            .get(url)
-                            .send()
-                            .and_then(|resp| resp.error_for_status())
-                        {
-                            if let Ok(bytes) = response.bytes() {
-                                if let Ok(dynamic_image) = image::load_from_memory(&bytes) {
-                                    inline.pixel_size =
-                                        Some((dynamic_image.width(), dynamic_image.height()));
-                                    inline.state = Some(picker.new_resize_protocol(dynamic_image));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            inline
-        })
-        .collect()
+fn load_dynamic_image(
+    source: &ResolvedImageSource,
+    remote_client: Option<&reqwest::blocking::Client>,
+) -> Option<image::DynamicImage> {
+    match source {
+        ResolvedImageSource::Local(path) => ImageReader::open(path).ok()?.decode().ok(),
+        ResolvedImageSource::Remote(url) => {
+            let client = remote_client?;
+            let response = client.get(url).send().ok()?.error_for_status().ok()?;
+            let bytes = response.bytes().ok()?;
+            image::load_from_memory(&bytes).ok()
+        }
+    }
 }
 
 fn resolve_image_source(markdown_path: &Path, src: &str) -> Option<ResolvedImageSource> {
@@ -776,6 +955,8 @@ mod tests {
     use super::*;
 
     fn test_app(lines: usize) -> App {
+        let (image_loader_tx, _request_rx) = mpsc::channel::<ImageLoadRequest>();
+        let (_result_tx, image_loader_rx) = mpsc::channel::<ImageLoadResult>();
         let mut doc_lines = Vec::with_capacity(lines);
         for idx in 0..lines {
             doc_lines.push(Line::from(format!("Line {}", idx + 1)));
@@ -799,6 +980,8 @@ mod tests {
             search_regex: None,
             search_matches: Vec::new(),
             active_match: 0,
+            image_loader_tx,
+            image_loader_rx,
         }
     }
 
@@ -938,6 +1121,40 @@ mod tests {
             protocol_override(ImageProtocol::Iterm2),
             Some(ProtocolType::Iterm2)
         );
+    }
+
+    #[test]
+    fn image_height_uses_html_hint_before_image_load() {
+        let app = test_app(1);
+        let image = InlineImage {
+            line_index: 0,
+            source: Some(ResolvedImageSource::Remote(
+                "https://example.com/image.png".to_string(),
+            )),
+            state: None,
+            pixel_size: None,
+            hinted_pixel_size: Some((1708, 1040)),
+            load_state: ImageLoadState::NotRequested,
+        };
+
+        assert!(app.image_height_for(&image, 80) > 0);
+    }
+
+    #[test]
+    fn image_height_collapses_after_failed_load_without_hint() {
+        let app = test_app(1);
+        let image = InlineImage {
+            line_index: 0,
+            source: Some(ResolvedImageSource::Remote(
+                "https://example.com/image.png".to_string(),
+            )),
+            state: None,
+            pixel_size: None,
+            hinted_pixel_size: None,
+            load_state: ImageLoadState::Failed,
+        };
+
+        assert_eq!(app.image_height_for(&image, 80), 0);
     }
 }
 

@@ -17,6 +17,7 @@ It renders markdown into a polished full-screen TUI with fast keyboard navigatio
   - lists and task lists
   - blockquotes
   - inline markdown images (`![alt](...)`) and HTML `<img ...>` tags
+  - lazy image loading with immediate placeholder layout reservation
   - syntax-highlighted fenced code blocks and inline code
   - links, tables, footnotes, emphasis/strong/strikethrough
 - Configurable image backend via `--image-protocol` (`auto`, `halfblocks`, `sixel`, `kitty`, `iterm2`)
@@ -26,6 +27,7 @@ It renders markdown into a polished full-screen TUI with fast keyboard navigatio
 
 Notes:
 - Local, `file://`, and remote `http://` / `https://` image sources are supported.
+- HTML `<img>` `width` and `height` hints are used to reserve image space before lazy loading finishes.
 - On macOS, terminal-native image protocols can trigger an "Allow Terminal-Initiated Display?" prompt.
   Use `--image-protocol halfblocks` if you want image rendering without that dialog.
 - Fenced code blocks with language tags (for example, a block tagged `rust`) render with syntax highlighting.

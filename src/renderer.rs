@@ -22,6 +22,7 @@ pub struct RenderedDoc {
 pub struct RenderedImage {
     pub src: String,
     pub line_index: usize,
+    pub hinted_pixel_size: Option<(u32, u32)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,6 +34,13 @@ enum ListKind {
 struct CodeHighlightAssets {
     syntax_set: SyntaxSet,
     theme: Theme,
+}
+
+#[derive(Debug, Clone)]
+struct HtmlImageTag {
+    src: String,
+    alt: String,
+    hinted_pixel_size: Option<(u32, u32)>,
 }
 
 pub fn render_markdown(input: &str) -> Result<RenderedDoc> {
@@ -86,10 +94,12 @@ pub fn render_markdown(input: &str) -> Result<RenderedDoc> {
         images: &mut Vec<RenderedImage>,
         src: String,
         alt_raw: String,
+        hinted_pixel_size: Option<(u32, u32)>,
         trailing_blank: bool,
     ) {
         let alt = alt_raw.trim().to_string();
         let line_index = lines.len();
+        let src_label = display_src_label(&src);
         let mut spans = Vec::new();
         spans.push(Span::styled(
             "[image] ".to_string(),
@@ -97,18 +107,18 @@ pub fn render_markdown(input: &str) -> Result<RenderedDoc> {
         ));
         if alt.is_empty() {
             spans.push(Span::styled(
-                src.clone(),
+                src_label.clone(),
                 Style::default().add_modifier(Modifier::UNDERLINED),
             ));
         } else {
             spans.push(Span::raw(alt));
-            spans.push(Span::styled(
-                format!(" ({src})"),
-                Style::default().add_modifier(Modifier::DIM),
-            ));
         }
         lines.push(Line::from(spans));
-        images.push(RenderedImage { src, line_index });
+        images.push(RenderedImage {
+            src,
+            line_index,
+            hinted_pixel_size,
+        });
         if trailing_blank {
             lines.push(Line::default());
         }
@@ -119,7 +129,7 @@ pub fn render_markdown(input: &str) -> Result<RenderedDoc> {
             match event {
                 Event::End(TagEnd::Image) => {
                     let (src, alt_raw) = pending_image.take().expect("pending image exists");
-                    append_image_entry(&mut lines, &mut images, src, alt_raw, true);
+                    append_image_entry(&mut lines, &mut images, src, alt_raw, None, true);
                 }
                 Event::Text(text)
                 | Event::Code(text)
@@ -360,8 +370,15 @@ pub fn render_markdown(input: &str) -> Result<RenderedDoc> {
                     ));
                 } else {
                     blank_line(&mut lines, &mut current_spans);
-                    for (src, alt) in html_images {
-                        append_image_entry(&mut lines, &mut images, src, alt, true);
+                    for image_tag in html_images {
+                        append_image_entry(
+                            &mut lines,
+                            &mut images,
+                            image_tag.src,
+                            image_tag.alt,
+                            image_tag.hinted_pixel_size,
+                            true,
+                        );
                     }
                 }
             }
@@ -411,8 +428,15 @@ pub fn render_markdown(input: &str) -> Result<RenderedDoc> {
                     ));
                 } else {
                     blank_line(&mut lines, &mut current_spans);
-                    for (src, alt) in html_images {
-                        append_image_entry(&mut lines, &mut images, src, alt, true);
+                    for image_tag in html_images {
+                        append_image_entry(
+                            &mut lines,
+                            &mut images,
+                            image_tag.src,
+                            image_tag.alt,
+                            image_tag.hinted_pixel_size,
+                            true,
+                        );
                     }
                 }
             }
@@ -424,7 +448,7 @@ pub fn render_markdown(input: &str) -> Result<RenderedDoc> {
     }
 
     if let Some((src, alt_raw)) = pending_image.take() {
-        append_image_entry(&mut lines, &mut images, src, alt_raw, false);
+        append_image_entry(&mut lines, &mut images, src, alt_raw, None, false);
     }
 
     while lines.last().map(|l| l.spans.is_empty()).unwrap_or(false) {
@@ -472,6 +496,17 @@ fn extract_code_block_language_token(info: &str) -> Option<&str> {
         None
     } else {
         Some(token)
+    }
+}
+
+fn display_src_label(src: &str) -> String {
+    const MAX_URL_DISPLAY_CHARS: usize = 96;
+    let src_chars = src.chars().count();
+    if src_chars <= MAX_URL_DISPLAY_CHARS {
+        src.to_string()
+    } else {
+        let truncated = src.chars().take(MAX_URL_DISPLAY_CHARS).collect::<String>();
+        format!("{truncated}...")
     }
 }
 
@@ -562,10 +597,12 @@ pub fn read_markdown_file(path: &std::path::Path) -> Result<String> {
         .with_context(|| format!("failed to read file: {}", path.display()))
 }
 
-fn extract_html_images(html: &str) -> Vec<(String, String)> {
+fn extract_html_images(html: &str) -> Vec<HtmlImageTag> {
     static IMG_TAG_RE: OnceLock<Regex> = OnceLock::new();
     static SRC_RE: OnceLock<Regex> = OnceLock::new();
     static ALT_RE: OnceLock<Regex> = OnceLock::new();
+    static WIDTH_RE: OnceLock<Regex> = OnceLock::new();
+    static HEIGHT_RE: OnceLock<Regex> = OnceLock::new();
 
     let img_tag_re = IMG_TAG_RE
         .get_or_init(|| Regex::new(r#"(?is)<img\b[^>]*>"#).expect("valid image tag regex"));
@@ -576,6 +613,14 @@ fn extract_html_images(html: &str) -> Vec<(String, String)> {
     let alt_re = ALT_RE.get_or_init(|| {
         Regex::new(r#"(?is)\balt\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+))"#)
             .expect("valid alt regex")
+    });
+    let width_re = WIDTH_RE.get_or_init(|| {
+        Regex::new(r#"(?is)\bwidth\s*=\s*(?:"([0-9]+)(?:px)?"|'([0-9]+)(?:px)?'|([0-9]+)(?:px)?)"#)
+            .expect("valid width regex")
+    });
+    let height_re = HEIGHT_RE.get_or_init(|| {
+        Regex::new(r#"(?is)\bheight\s*=\s*(?:"([0-9]+)(?:px)?"|'([0-9]+)(?:px)?'|([0-9]+)(?:px)?)"#)
+            .expect("valid height regex")
     });
 
     img_tag_re
@@ -589,9 +634,29 @@ fn extract_html_images(html: &str) -> Vec<(String, String)> {
                 .captures(tag)
                 .and_then(|caps| first_non_empty_capture_owned(&caps))
                 .unwrap_or_default();
-            Some((src, alt))
+            let hinted_pixel_size = parse_image_hint_from_tag(tag, width_re, height_re);
+            Some(HtmlImageTag {
+                src,
+                alt,
+                hinted_pixel_size,
+            })
         })
         .collect()
+}
+
+fn parse_image_hint_from_tag(tag: &str, width_re: &Regex, height_re: &Regex) -> Option<(u32, u32)> {
+    let width = parse_html_dimension_attr(tag, width_re);
+    let height = parse_html_dimension_attr(tag, height_re);
+    match (width, height) {
+        (Some(w), Some(h)) if w > 0 && h > 0 => Some((w, h)),
+        _ => None,
+    }
+}
+
+fn parse_html_dimension_attr(tag: &str, attr_re: &Regex) -> Option<u32> {
+    let caps = attr_re.captures(tag)?;
+    let raw = first_non_empty_capture_owned(&caps)?;
+    raw.parse::<u32>().ok().filter(|value| *value > 0)
 }
 
 fn first_non_empty_capture_owned(caps: &regex::Captures<'_>) -> Option<String> {
@@ -611,6 +676,7 @@ mod tests {
         let doc = render_markdown("![Alt Text](images/sample.png)").expect("render succeeds");
         assert_eq!(doc.images.len(), 1);
         assert_eq!(doc.images[0].src, "images/sample.png");
+        assert_eq!(doc.images[0].hinted_pixel_size, None);
 
         let caption_line = &doc.lines[doc.images[0].line_index];
         let caption_text = caption_line
@@ -623,10 +689,11 @@ mod tests {
 
     #[test]
     fn html_img_tags_are_extracted_for_runtime_rendering() {
-        let input = r#"<img alt="Preview" src="https://example.com/preview.png" />"#;
+        let input = r#"<img alt="Preview" width="1708" height="1040" src="https://example.com/preview.png" />"#;
         let doc = render_markdown(input).expect("render succeeds");
         assert_eq!(doc.images.len(), 1);
         assert_eq!(doc.images[0].src, "https://example.com/preview.png");
+        assert_eq!(doc.images[0].hinted_pixel_size, Some((1708, 1040)));
 
         let caption_line = &doc.lines[doc.images[0].line_index];
         let caption_text = caption_line
@@ -635,6 +702,24 @@ mod tests {
             .map(|span| span.content.as_ref())
             .collect::<String>();
         assert!(caption_text.contains("Preview"));
+    }
+
+    #[test]
+    fn long_image_urls_are_truncated_in_caption_display() {
+        let input = "![](https://example.com/this/is/a/very/long/path/that/should/be/truncated/when/rendered/in/the/caption/to/avoid/wrapping/issues.png)";
+        let doc = render_markdown(input).expect("render succeeds");
+        let caption_line = &doc.lines[doc.images[0].line_index];
+        let caption_text = caption_line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert!(caption_text.contains("..."));
+        assert!(caption_text.contains("[image]"));
+        assert!(doc.images[0]
+            .src
+            .contains("very/long/path/that/should/be/truncated"));
     }
 
     #[test]

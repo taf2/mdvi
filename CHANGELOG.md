@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-02-10
+
+### Added
+- Lazy image loading with non-blocking background fetch/decode so markdown opens immediately.
+
+### Changed
+- Image layout now reserves space before load using HTML `<img width height>` hints when available.
+- Images without explicit dimensions use a default placeholder estimate during lazy loading.
+- Improved image rendering stability while scrolling past images by fixing partial-viewport draw artifacts and distortion.
+- Long image source captions are truncated in display text to reduce wrap bleed in the viewport.
+
 ## [0.4.0] - 2026-02-10
 
 ### Added
