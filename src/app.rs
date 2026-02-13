@@ -25,7 +25,7 @@ use ratatui::{
 use ratatui_image::{
     picker::{Picker, ProtocolType},
     protocol::StatefulProtocol,
-    Resize, ResizeEncodeRender,
+    CropOptions, Resize, ResizeEncodeRender,
 };
 use regex::{Regex, RegexBuilder};
 use unicode_width::UnicodeWidthStr;
@@ -55,6 +55,7 @@ struct App {
     search_regex: Option<Regex>,
     search_matches: Vec<usize>,
     active_match: usize,
+    focused_image: Option<usize>,
     image_loader_tx: Sender<ImageLoadRequest>,
     image_loader_rx: Receiver<ImageLoadResult>,
     image_resize_tx: Sender<ImageResizeRequest>,
@@ -68,6 +69,7 @@ struct InlineImage {
     source: Option<ResolvedImageSource>,
     state: Option<StatefulProtocol>,
     resize_pending: bool,
+    has_encoded_state: bool,
     pixel_size: Option<(u32, u32)>,
     hinted_pixel_size: Option<(u32, u32)>,
     load_state: ImageLoadState,
@@ -89,6 +91,12 @@ struct HighlightedLinesCache {
     query: Option<String>,
     active_match_line: Option<usize>,
     lines: Vec<Line<'static>>,
+}
+
+struct ImageVirtualBounds {
+    image_index: usize,
+    start_row: usize,
+    end_row: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -187,6 +195,7 @@ impl App {
             search_regex: None,
             search_matches: Vec::new(),
             active_match: 0,
+            focused_image: None,
             image_loader_tx,
             image_loader_rx,
             image_resize_tx,
@@ -219,6 +228,7 @@ impl App {
                     .enumerate()
                     .map(|(idx, image)| (image.line_index, idx))
                     .collect::<BTreeMap<usize, usize>>();
+                self.focused_image = None;
                 self.invalidate_highlight_cache();
                 self.request_local_dimension_probes();
                 if self.search_regex.is_some() {
@@ -265,20 +275,173 @@ impl App {
     }
 
     fn scroll_down(&mut self, n: usize, viewport_height: usize, content_width: u16) {
+        self.focused_image = None;
         let max = self.max_scroll(viewport_height, content_width);
         self.scroll = self.scroll.saturating_add(n).min(max);
     }
 
     fn scroll_up(&mut self, n: usize) {
+        self.focused_image = None;
         self.scroll = self.scroll.saturating_sub(n);
     }
 
     fn jump_top(&mut self) {
+        self.focused_image = None;
         self.scroll = 0;
     }
 
     fn jump_bottom(&mut self, viewport_height: usize, content_width: u16) {
+        self.focused_image = None;
         self.scroll = self.max_scroll(viewport_height, content_width);
+    }
+
+    fn preferred_cursor_screen_row(viewport_height: usize) -> usize {
+        if viewport_height == 0 {
+            0
+        } else {
+            (viewport_height / 2).min(viewport_height.saturating_sub(1))
+        }
+    }
+
+    fn cursor_virtual_row_for_navigation(
+        &mut self,
+        viewport_height: usize,
+        content_width: u16,
+    ) -> usize {
+        let total_rows = self.total_virtual_lines(content_width).max(1);
+        if viewport_height == 0 {
+            return self.scroll.min(total_rows.saturating_sub(1));
+        }
+
+        let preferred_cursor_screen_row = Self::preferred_cursor_screen_row(viewport_height);
+        let max_visible_screen_row = total_rows
+            .saturating_sub(1)
+            .saturating_sub(self.scroll)
+            .min(viewport_height.saturating_sub(1));
+
+        self.scroll
+            .saturating_add(preferred_cursor_screen_row.min(max_visible_screen_row))
+    }
+
+    fn scroll_for_target_cursor_row(
+        &mut self,
+        target_cursor_row: usize,
+        viewport_height: usize,
+        content_width: u16,
+    ) -> usize {
+        if viewport_height == 0 {
+            return target_cursor_row;
+        }
+
+        let preferred_cursor_screen_row = Self::preferred_cursor_screen_row(viewport_height);
+        target_cursor_row
+            .saturating_sub(preferred_cursor_screen_row)
+            .min(self.max_scroll(viewport_height, content_width))
+    }
+
+    fn image_virtual_bounds(&self, content_width: u16) -> Vec<ImageVirtualBounds> {
+        let mut bounds = Vec::new();
+        let mut accumulated_image_rows = 0usize;
+
+        for (image_index, image) in self.images.iter().enumerate() {
+            let height = self.image_height_for(image, content_width);
+            if height == 0 {
+                continue;
+            }
+
+            let start_row = image
+                .line_index
+                .saturating_add(1)
+                .saturating_add(accumulated_image_rows);
+            let end_row = start_row.saturating_add(height);
+            bounds.push(ImageVirtualBounds {
+                image_index,
+                start_row,
+                end_row,
+            });
+            accumulated_image_rows = accumulated_image_rows.saturating_add(height);
+        }
+
+        bounds
+    }
+
+    fn image_bounds_for(
+        &self,
+        image_index: usize,
+        content_width: u16,
+    ) -> Option<ImageVirtualBounds> {
+        self.image_virtual_bounds(content_width)
+            .into_iter()
+            .find(|bounds| bounds.image_index == image_index)
+    }
+
+    fn image_at_virtual_row(&self, row: usize, content_width: u16) -> Option<usize> {
+        self.image_virtual_bounds(content_width)
+            .into_iter()
+            .find(|bounds| row >= bounds.start_row && row < bounds.end_row)
+            .map(|bounds| bounds.image_index)
+    }
+
+    fn scroll_down_with_image_focus(&mut self, viewport_height: usize, content_width: u16) {
+        let max_scroll = self.max_scroll(viewport_height, content_width);
+        if self.scroll >= max_scroll {
+            return;
+        }
+
+        let cursor_row = self.cursor_virtual_row_for_navigation(viewport_height, content_width);
+        let current_image = self.image_at_virtual_row(cursor_row, content_width);
+        if let (Some(focused_image), Some(current_image_index)) =
+            (self.focused_image, current_image)
+        {
+            if focused_image == current_image_index {
+                if let Some(bounds) = self.image_bounds_for(current_image_index, content_width) {
+                    let total_rows = self.total_virtual_lines(content_width).max(1);
+                    let target_row = bounds.end_row.min(total_rows.saturating_sub(1));
+                    self.scroll = self.scroll_for_target_cursor_row(
+                        target_row,
+                        viewport_height,
+                        content_width,
+                    );
+                    self.focused_image = None;
+                    return;
+                }
+            }
+        }
+
+        self.scroll = self.scroll.saturating_add(1).min(max_scroll);
+        let next_cursor_row =
+            self.cursor_virtual_row_for_navigation(viewport_height, content_width);
+        self.focused_image = self.image_at_virtual_row(next_cursor_row, content_width);
+    }
+
+    fn scroll_up_with_image_focus(&mut self, viewport_height: usize, content_width: u16) {
+        if self.scroll == 0 {
+            return;
+        }
+
+        let cursor_row = self.cursor_virtual_row_for_navigation(viewport_height, content_width);
+        let current_image = self.image_at_virtual_row(cursor_row, content_width);
+        if let (Some(focused_image), Some(current_image_index)) =
+            (self.focused_image, current_image)
+        {
+            if focused_image == current_image_index {
+                if let Some(bounds) = self.image_bounds_for(current_image_index, content_width) {
+                    let target_row = bounds.start_row.saturating_sub(1);
+                    self.scroll = self.scroll_for_target_cursor_row(
+                        target_row,
+                        viewport_height,
+                        content_width,
+                    );
+                    self.focused_image = None;
+                    return;
+                }
+            }
+        }
+
+        self.scroll = self.scroll.saturating_sub(1);
+        let next_cursor_row =
+            self.cursor_virtual_row_for_navigation(viewport_height, content_width);
+        self.focused_image = self.image_at_virtual_row(next_cursor_row, content_width);
     }
 
     fn line_text_at(&self, index: usize) -> String {
@@ -300,6 +463,7 @@ impl App {
             self.search_regex = None;
             self.search_matches.clear();
             self.active_match = 0;
+            self.focused_image = None;
             self.invalidate_highlight_cache();
             self.invalidate_virtual_row_cache();
             self.status = "search cleared".to_string();
@@ -320,6 +484,7 @@ impl App {
         self.search_query = Some(query.to_string());
         self.search_regex = Some(regex);
         self.rebuild_search_matches();
+        self.focused_image = None;
         self.invalidate_highlight_cache();
         self.invalidate_virtual_row_cache();
 
@@ -340,6 +505,7 @@ impl App {
             return;
         }
         self.active_match = (self.active_match + 1) % self.search_matches.len();
+        self.focused_image = None;
         self.invalidate_highlight_cache();
         let target_row =
             self.virtual_row_for_doc_line(self.search_matches[self.active_match], content_width);
@@ -357,6 +523,7 @@ impl App {
         } else {
             self.active_match -= 1;
         }
+        self.focused_image = None;
         self.invalidate_highlight_cache();
         let target_row =
             self.virtual_row_for_doc_line(self.search_matches[self.active_match], content_width);
@@ -396,6 +563,7 @@ impl App {
     fn rebuild_search_matches(&mut self) {
         self.search_matches.clear();
         self.active_match = 0;
+        self.focused_image = None;
         self.invalidate_highlight_cache();
 
         let Some(regex) = self.search_regex.as_ref() else {
@@ -495,9 +663,11 @@ impl App {
             .is_ok()
         {
             image.resize_pending = false;
+            image.has_encoded_state = false;
             image.load_state = ImageLoadState::Loading;
         } else {
             image.resize_pending = false;
+            image.has_encoded_state = false;
             image.load_state = ImageLoadState::Failed;
         }
     }
@@ -540,7 +710,7 @@ impl App {
         }
     }
 
-    fn request_image_resize(&mut self, image_index: usize, area: Rect) {
+    fn request_image_resize(&mut self, image_index: usize, area: Rect, resize: Resize) {
         let Some(image) = self.images.get_mut(image_index) else {
             return;
         };
@@ -548,7 +718,6 @@ impl App {
             return;
         }
 
-        let resize = Resize::Fit(None);
         let Some(target_area) = image
             .state
             .as_ref()
@@ -585,6 +754,7 @@ impl App {
             };
             image.state = Some(result.protocol);
             image.resize_pending = false;
+            image.has_encoded_state = true;
             changed = true;
         }
         changed
@@ -620,11 +790,13 @@ impl App {
                     image.pixel_size = Some((dynamic_image.width(), dynamic_image.height()));
                     image.state = Some(self.picker.new_resize_protocol(dynamic_image));
                     image.resize_pending = false;
+                    image.has_encoded_state = false;
                     image.load_state = ImageLoadState::Loaded;
                     changed = true;
                 }
                 ImageLoadResultPayload::LoadedImage(None) => {
                     image.resize_pending = false;
+                    image.has_encoded_state = false;
                     image.state = None;
                     image.load_state = ImageLoadState::Failed;
                     changed = true;
@@ -791,7 +963,6 @@ pub fn run(file_path: PathBuf, start_line: usize, image_protocol: ImageProtocol)
                         continue;
                     }
                     let is_fully_visible = plan_top >= view_top && plan_bottom <= view_bottom;
-
                     let image_y = content_inner
                         .y
                         .saturating_add((visible_top - view_top) as u16);
@@ -805,31 +976,36 @@ pub fn run(file_path: PathBuf, start_line: usize, image_protocol: ImageProtocol)
                         continue;
                     }
                     frame.render_widget(Clear, image_area);
-                    // Rendering partially visible images causes repeated re-encoding with shrinking
-                    // target heights while scrolling. That produces visible width distortion and
-                    // choppy movement, so only draw loaded images when fully visible.
                     if is_fully_visible {
-                        app.request_image_resize(plan.image_index, image_area);
-                        if let Some(image_state) = app.images[plan.image_index].state.as_mut() {
-                            image_state.render(image_area, frame.buffer_mut());
-                        } else {
-                            let placeholder =
-                                App::image_placeholder(&app.images[plan.image_index]);
-                            frame.render_widget(
-                                Paragraph::new(Line::from(Span::styled(
-                                    format!("  {placeholder}"),
-                                    Style::default().add_modifier(Modifier::DIM),
-                                ))),
-                                image_area,
-                            );
-                        }
-                    } else if app.images[plan.image_index].state.is_none() {
+                        app.request_image_resize(plan.image_index, image_area, Resize::Fit(None));
+                    } else {
+                        app.request_image_resize(
+                            plan.image_index,
+                            image_area,
+                            Resize::Crop(Some(CropOptions {
+                                clip_top: visible_top > plan_top,
+                                clip_left: false,
+                            })),
+                        );
+                    }
+                    if let Some(image_state) = app.images[plan.image_index].state.as_mut() {
+                        image_state.render(image_area, frame.buffer_mut());
+                    } else {
                         let placeholder = App::image_placeholder(&app.images[plan.image_index]);
                         frame.render_widget(
                             Paragraph::new(Line::from(Span::styled(
                                 format!("  {placeholder}"),
                                 Style::default().add_modifier(Modifier::DIM),
                             ))),
+                            image_area,
+                        );
+                    }
+
+                    if app.focused_image == Some(plan.image_index) {
+                        frame.render_widget(
+                            Block::default()
+                                .borders(Borders::ALL)
+                                .border_style(Style::default().add_modifier(Modifier::BOLD)),
                             image_area,
                         );
                     }
@@ -855,6 +1031,12 @@ pub fn run(file_path: PathBuf, start_line: usize, image_protocol: ImageProtocol)
                                 right.push_str(&format!(
                                     "  |  images {loaded_images}/{}, loading {loading_images}, failed {failed_images}",
                                     app.images.len()
+                                ));
+                            }
+                            if let Some(focused_image) = app.focused_image {
+                                right.push_str(&format!(
+                                    "  |  image {} selected",
+                                    focused_image.saturating_add(1)
                                 ));
                             }
                             if !app.search_matches.is_empty() {
@@ -999,11 +1181,11 @@ fn handle_key_event(
             false
         }
         (KeyCode::Char('j'), _) | (KeyCode::Down, _) => {
-            app.scroll_down(1, viewport_height, content_width);
+            app.scroll_down_with_image_focus(viewport_height, content_width);
             false
         }
         (KeyCode::Char('k'), _) | (KeyCode::Up, _) => {
-            app.scroll_up(1);
+            app.scroll_up_with_image_focus(viewport_height, content_width);
             false
         }
         (KeyCode::PageDown, _) => {
@@ -1066,6 +1248,7 @@ fn prepare_images_for_doc(markdown_path: &Path, doc: &RenderedDoc) -> Vec<Inline
                 source,
                 state: None,
                 resize_pending: false,
+                has_encoded_state: false,
                 pixel_size: None,
                 hinted_pixel_size: image.hinted_pixel_size,
                 load_state,
@@ -1224,6 +1407,7 @@ mod tests {
             search_regex: None,
             search_matches: Vec::new(),
             active_match: 0,
+            focused_image: None,
             image_loader_tx,
             image_loader_rx,
             image_resize_tx,
@@ -1238,6 +1422,24 @@ mod tests {
             .iter()
             .map(|span| span.content.as_ref())
             .collect::<String>()
+    }
+
+    fn app_with_image_for_navigation() -> App {
+        let mut app = test_app(24);
+        app.images = vec![InlineImage {
+            line_index: 8,
+            source: Some(ResolvedImageSource::Remote(
+                "https://example.com/image.png".to_string(),
+            )),
+            state: None,
+            resize_pending: false,
+            has_encoded_state: false,
+            pixel_size: None,
+            hinted_pixel_size: Some((160, 160)),
+            load_state: ImageLoadState::Loaded,
+        }];
+        app.image_index_by_line = BTreeMap::from([(8usize, 0usize)]);
+        app
     }
 
     #[test]
@@ -1282,6 +1484,7 @@ mod tests {
             )),
             state: None,
             resize_pending: false,
+            has_encoded_state: false,
             pixel_size: None,
             hinted_pixel_size: None,
             load_state: ImageLoadState::Loading,
@@ -1318,6 +1521,7 @@ mod tests {
                 ))),
                 state: None,
                 resize_pending: false,
+                has_encoded_state: false,
                 pixel_size: None,
                 hinted_pixel_size: None,
                 load_state: ImageLoadState::NotRequested,
@@ -1329,6 +1533,7 @@ mod tests {
                 )),
                 state: None,
                 resize_pending: false,
+                has_encoded_state: false,
                 pixel_size: None,
                 hinted_pixel_size: None,
                 load_state: ImageLoadState::NotRequested,
@@ -1363,6 +1568,7 @@ mod tests {
             ))),
             state: None,
             resize_pending: false,
+            has_encoded_state: false,
             pixel_size: None,
             hinted_pixel_size: None,
             load_state: ImageLoadState::NotRequested,
@@ -1397,6 +1603,7 @@ mod tests {
                 )),
                 state: None,
                 resize_pending: false,
+                has_encoded_state: false,
                 pixel_size: None,
                 hinted_pixel_size: None,
                 load_state: ImageLoadState::Loading,
@@ -1439,13 +1646,14 @@ mod tests {
                     .new_resize_protocol(image::DynamicImage::new_rgb8(320, 200)),
             ),
             resize_pending: false,
+            has_encoded_state: false,
             pixel_size: Some((320, 200)),
             hinted_pixel_size: None,
             load_state: ImageLoadState::Loaded,
         }];
         app.image_resize_tx = image_resize_tx;
 
-        app.request_image_resize(0, Rect::new(0, 0, 40, 10));
+        app.request_image_resize(0, Rect::new(0, 0, 40, 10), Resize::Fit(None));
 
         assert!(app.images[0].resize_pending);
         assert!(app.images[0].state.is_none());
@@ -1467,6 +1675,7 @@ mod tests {
             )),
             state: None,
             resize_pending: true,
+            has_encoded_state: true,
             pixel_size: Some((320, 200)),
             hinted_pixel_size: None,
             load_state: ImageLoadState::Loaded,
@@ -1494,6 +1703,38 @@ mod tests {
         app.scroll = 10;
         app.scroll_up(500);
         assert_eq!(app.scroll, 0);
+    }
+
+    #[test]
+    fn scroll_down_focuses_image_then_jumps_past() {
+        let mut app = app_with_image_for_navigation();
+        let viewport_height = 10;
+        let content_width = 80;
+
+        app.scroll = 3;
+        app.scroll_down_with_image_focus(viewport_height, content_width);
+        assert_eq!(app.scroll, 4);
+        assert_eq!(app.focused_image, Some(0));
+
+        app.scroll_down_with_image_focus(viewport_height, content_width);
+        assert_eq!(app.scroll, 14);
+        assert_eq!(app.focused_image, None);
+    }
+
+    #[test]
+    fn scroll_up_focuses_image_then_jumps_before() {
+        let mut app = app_with_image_for_navigation();
+        let viewport_height = 10;
+        let content_width = 80;
+
+        app.scroll = 14;
+        app.scroll_up_with_image_focus(viewport_height, content_width);
+        assert_eq!(app.scroll, 13);
+        assert_eq!(app.focused_image, Some(0));
+
+        app.scroll_up_with_image_focus(viewport_height, content_width);
+        assert_eq!(app.scroll, 3);
+        assert_eq!(app.focused_image, None);
     }
 
     #[test]
@@ -1696,6 +1937,7 @@ mod tests {
             )),
             state: None,
             resize_pending: false,
+            has_encoded_state: false,
             pixel_size: None,
             hinted_pixel_size: Some((1708, 1040)),
             load_state: ImageLoadState::NotRequested,
@@ -1714,6 +1956,7 @@ mod tests {
             )),
             state: None,
             resize_pending: false,
+            has_encoded_state: false,
             pixel_size: None,
             hinted_pixel_size: None,
             load_state: ImageLoadState::Failed,
