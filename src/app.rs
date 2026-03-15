@@ -28,7 +28,7 @@ use ratatui_image::{
     CropOptions, Resize, ResizeEncodeRender,
 };
 use regex::{Regex, RegexBuilder};
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
     renderer::{read_markdown_file, render_markdown, RenderedDoc},
@@ -56,6 +56,8 @@ struct App {
     search_regex: Option<Regex>,
     search_matches: Vec<usize>,
     active_match: usize,
+    cursor_row: usize,
+    cursor_column: usize,
     focused_image: Option<usize>,
     image_loader_tx: Sender<ImageLoadRequest>,
     image_loader_rx: Receiver<ImageLoadResult>,
@@ -163,6 +165,12 @@ enum ImageResizeMode {
     Scale,
 }
 
+#[derive(Clone, Copy)]
+enum WordMotionKind {
+    Small,
+    Big,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct ImageResizeVariant {
     width: u16,
@@ -216,6 +224,8 @@ impl App {
             search_regex: None,
             search_matches: Vec::new(),
             active_match: 0,
+            cursor_row: scroll,
+            cursor_column: 0,
             focused_image: None,
             image_loader_tx,
             image_loader_rx,
@@ -295,69 +305,78 @@ impl App {
             .saturating_sub(viewport_height.saturating_sub(1))
     }
 
-    fn scroll_down(&mut self, n: usize, viewport_height: usize, content_width: u16) {
-        self.focused_image = None;
-        let max = self.max_scroll(viewport_height, content_width);
-        self.scroll = self.scroll.saturating_add(n).min(max);
+    fn clamp_cursor_row(&mut self, content_width: u16) {
+        let total_rows = self.total_virtual_lines(content_width).max(1);
+        self.cursor_row = self.cursor_row.min(total_rows.saturating_sub(1));
     }
 
-    fn scroll_up(&mut self, n: usize) {
+    fn ensure_cursor_visible(&mut self, viewport_height: usize, content_width: u16) {
+        self.clamp_cursor_row(content_width);
+        let max_scroll = self.max_scroll(viewport_height, content_width);
+        if viewport_height == 0 {
+            self.scroll = self.cursor_row.min(max_scroll);
+            return;
+        }
+
+        if self.cursor_row < self.scroll {
+            self.scroll = self.cursor_row;
+        } else {
+            let viewport_bottom = self
+                .scroll
+                .saturating_add(viewport_height.saturating_sub(1));
+            if self.cursor_row > viewport_bottom {
+                self.scroll = self
+                    .cursor_row
+                    .saturating_sub(viewport_height.saturating_sub(1));
+            }
+        }
+
+        self.scroll = self.scroll.min(max_scroll);
+    }
+
+    fn scroll_down(&mut self, n: usize, viewport_height: usize, content_width: u16) {
         self.focused_image = None;
-        self.scroll = self.scroll.saturating_sub(n);
+        self.clamp_cursor_row(content_width);
+        let total_rows = self.total_virtual_lines(content_width).max(1);
+        let max_scroll = self.max_scroll(viewport_height, content_width);
+        let next_scroll = self.scroll.saturating_add(n).min(max_scroll);
+        let delta = next_scroll.saturating_sub(self.scroll);
+        self.scroll = next_scroll;
+        self.cursor_row = self
+            .cursor_row
+            .saturating_add(delta)
+            .min(total_rows.saturating_sub(1));
+    }
+
+    fn scroll_up(&mut self, n: usize, _viewport_height: usize, content_width: u16) {
+        self.focused_image = None;
+        self.clamp_cursor_row(content_width);
+        let next_scroll = self.scroll.saturating_sub(n);
+        let delta = self.scroll.saturating_sub(next_scroll);
+        self.scroll = next_scroll;
+        self.cursor_row = self.cursor_row.saturating_sub(delta);
     }
 
     fn jump_top(&mut self) {
         self.focused_image = None;
+        self.cursor_row = 0;
         self.scroll = 0;
     }
 
     fn jump_bottom(&mut self, viewport_height: usize, content_width: u16) {
         self.focused_image = None;
-        self.scroll = self.max_scroll(viewport_height, content_width);
-    }
-
-    fn preferred_cursor_screen_row(viewport_height: usize) -> usize {
-        if viewport_height == 0 {
-            0
-        } else {
-            (viewport_height / 2).min(viewport_height.saturating_sub(1))
-        }
-    }
-
-    fn cursor_virtual_row_for_navigation(
-        &mut self,
-        viewport_height: usize,
-        content_width: u16,
-    ) -> usize {
         let total_rows = self.total_virtual_lines(content_width).max(1);
-        if viewport_height == 0 {
-            return self.scroll.min(total_rows.saturating_sub(1));
-        }
-
-        let preferred_cursor_screen_row = Self::preferred_cursor_screen_row(viewport_height);
-        let max_visible_screen_row = total_rows
-            .saturating_sub(1)
-            .saturating_sub(self.scroll)
-            .min(viewport_height.saturating_sub(1));
-
-        self.scroll
-            .saturating_add(preferred_cursor_screen_row.min(max_visible_screen_row))
+        self.cursor_row = total_rows.saturating_sub(1);
+        self.ensure_cursor_visible(viewport_height, content_width);
     }
 
-    fn scroll_for_target_cursor_row(
-        &mut self,
-        target_cursor_row: usize,
-        viewport_height: usize,
-        content_width: u16,
-    ) -> usize {
-        if viewport_height == 0 {
-            return target_cursor_row;
-        }
-
-        let preferred_cursor_screen_row = Self::preferred_cursor_screen_row(viewport_height);
-        target_cursor_row
-            .saturating_sub(preferred_cursor_screen_row)
-            .min(self.max_scroll(viewport_height, content_width))
+    fn cursor_doc_line_for_navigation(&mut self, content_width: u16) -> usize {
+        self.clamp_cursor_row(content_width);
+        self.build_display_doc(content_width)
+            .doc_line_for_row
+            .get(self.cursor_row)
+            .copied()
+            .unwrap_or_else(|| self.doc.lines.len().saturating_sub(1))
     }
 
     fn image_virtual_bounds(&self, content_width: u16) -> Vec<ImageVirtualBounds> {
@@ -404,65 +423,57 @@ impl App {
     }
 
     fn scroll_down_with_image_focus(&mut self, viewport_height: usize, content_width: u16) {
-        let max_scroll = self.max_scroll(viewport_height, content_width);
-        if self.scroll >= max_scroll {
+        self.clamp_cursor_row(content_width);
+        let total_rows = self.total_virtual_lines(content_width).max(1);
+        if self.cursor_row >= total_rows.saturating_sub(1) {
             return;
         }
 
-        let cursor_row = self.cursor_virtual_row_for_navigation(viewport_height, content_width);
-        let current_image = self.image_at_virtual_row(cursor_row, content_width);
+        let current_image = self.image_at_virtual_row(self.cursor_row, content_width);
         if let (Some(focused_image), Some(current_image_index)) =
             (self.focused_image, current_image)
         {
             if focused_image == current_image_index {
                 if let Some(bounds) = self.image_bounds_for(current_image_index, content_width) {
-                    let total_rows = self.total_virtual_lines(content_width).max(1);
-                    let target_row = bounds.end_row.min(total_rows.saturating_sub(1));
-                    self.scroll = self.scroll_for_target_cursor_row(
-                        target_row,
-                        viewport_height,
-                        content_width,
-                    );
+                    self.cursor_row = bounds.end_row.min(total_rows.saturating_sub(1));
+                    self.ensure_cursor_visible(viewport_height, content_width);
                     self.focused_image = None;
                     return;
                 }
             }
         }
 
-        self.scroll = self.scroll.saturating_add(1).min(max_scroll);
-        let next_cursor_row =
-            self.cursor_virtual_row_for_navigation(viewport_height, content_width);
-        self.focused_image = self.image_at_virtual_row(next_cursor_row, content_width);
+        self.cursor_row = self
+            .cursor_row
+            .saturating_add(1)
+            .min(total_rows.saturating_sub(1));
+        self.ensure_cursor_visible(viewport_height, content_width);
+        self.focused_image = self.image_at_virtual_row(self.cursor_row, content_width);
     }
 
     fn scroll_up_with_image_focus(&mut self, viewport_height: usize, content_width: u16) {
-        if self.scroll == 0 {
+        self.clamp_cursor_row(content_width);
+        if self.cursor_row == 0 {
             return;
         }
 
-        let cursor_row = self.cursor_virtual_row_for_navigation(viewport_height, content_width);
-        let current_image = self.image_at_virtual_row(cursor_row, content_width);
+        let current_image = self.image_at_virtual_row(self.cursor_row, content_width);
         if let (Some(focused_image), Some(current_image_index)) =
             (self.focused_image, current_image)
         {
             if focused_image == current_image_index {
                 if let Some(bounds) = self.image_bounds_for(current_image_index, content_width) {
-                    let target_row = bounds.start_row.saturating_sub(1);
-                    self.scroll = self.scroll_for_target_cursor_row(
-                        target_row,
-                        viewport_height,
-                        content_width,
-                    );
+                    self.cursor_row = bounds.start_row.saturating_sub(1);
+                    self.ensure_cursor_visible(viewport_height, content_width);
                     self.focused_image = None;
                     return;
                 }
             }
         }
 
-        self.scroll = self.scroll.saturating_sub(1);
-        let next_cursor_row =
-            self.cursor_virtual_row_for_navigation(viewport_height, content_width);
-        self.focused_image = self.image_at_virtual_row(next_cursor_row, content_width);
+        self.cursor_row = self.cursor_row.saturating_sub(1);
+        self.ensure_cursor_visible(viewport_height, content_width);
+        self.focused_image = self.image_at_virtual_row(self.cursor_row, content_width);
     }
 
     fn line_text_at(&self, index: usize) -> String {
@@ -476,6 +487,162 @@ impl App {
                     .collect::<String>()
             })
             .unwrap_or_default()
+    }
+
+    fn line_width_at(&self, index: usize) -> usize {
+        self.line_text_at(index).width()
+    }
+
+    fn max_cursor_column_for_line(&self, index: usize) -> usize {
+        self.line_width_at(index).saturating_sub(1)
+    }
+
+    fn effective_cursor_column_for_line(&self, index: usize) -> usize {
+        self.cursor_column
+            .min(self.max_cursor_column_for_line(index))
+    }
+
+    fn move_cursor_left(&mut self) {
+        self.cursor_column = self.cursor_column.saturating_sub(1);
+    }
+
+    fn move_cursor_right(&mut self, line_index: usize) {
+        let max_column = self.max_cursor_column_for_line(line_index);
+        self.cursor_column = self.cursor_column.saturating_add(1).min(max_column);
+    }
+
+    fn byte_index_for_column(text: &str, target_column: usize) -> usize {
+        let mut column = 0usize;
+        for (idx, ch) in text.char_indices() {
+            let width = ch.width().unwrap_or(0).max(1);
+            if column >= target_column {
+                return idx;
+            }
+            if column + width > target_column {
+                return idx;
+            }
+            column += width;
+        }
+        text.len()
+    }
+
+    fn column_for_byte_index(text: &str, target_index: usize) -> usize {
+        let mut column = 0usize;
+        for (idx, ch) in text.char_indices() {
+            if idx >= target_index {
+                break;
+            }
+            column += ch.width().unwrap_or(0).max(1);
+        }
+        column
+    }
+
+    fn classify_motion_char(ch: char, kind: WordMotionKind) -> u8 {
+        if ch.is_whitespace() {
+            0
+        } else if matches!(kind, WordMotionKind::Small) && (ch.is_alphanumeric() || ch == '_') {
+            1
+        } else {
+            2
+        }
+    }
+
+    fn find_next_word_start(text: &str, column: usize, kind: WordMotionKind) -> Option<usize> {
+        let chars = text.char_indices().collect::<Vec<_>>();
+        if chars.is_empty() {
+            return None;
+        }
+
+        let mut idx = chars
+            .partition_point(|(byte_idx, _)| *byte_idx < Self::byte_index_for_column(text, column));
+        if idx >= chars.len() {
+            return None;
+        }
+
+        let current_class = Self::classify_motion_char(chars[idx].1, kind);
+        if current_class == 0 {
+            while idx < chars.len() && Self::classify_motion_char(chars[idx].1, kind) == 0 {
+                idx += 1;
+            }
+        } else {
+            while idx < chars.len()
+                && Self::classify_motion_char(chars[idx].1, kind) == current_class
+            {
+                idx += 1;
+            }
+            while idx < chars.len() && Self::classify_motion_char(chars[idx].1, kind) == 0 {
+                idx += 1;
+            }
+        }
+
+        chars
+            .get(idx)
+            .map(|(byte_idx, _)| Self::column_for_byte_index(text, *byte_idx))
+    }
+
+    fn find_prev_word_start(text: &str, column: usize, kind: WordMotionKind) -> Option<usize> {
+        let chars = text.char_indices().collect::<Vec<_>>();
+        if chars.is_empty() {
+            return None;
+        }
+
+        let byte_index = Self::byte_index_for_column(text, column);
+        let mut idx = chars.partition_point(|(char_idx, _)| *char_idx < byte_index);
+        idx = idx.saturating_sub(1);
+
+        while idx > 0 && Self::classify_motion_char(chars[idx].1, kind) == 0 {
+            idx -= 1;
+        }
+        if idx == 0 && Self::classify_motion_char(chars[idx].1, kind) == 0 {
+            return None;
+        }
+
+        let current_class = Self::classify_motion_char(chars[idx].1, kind);
+        while idx > 0 && Self::classify_motion_char(chars[idx - 1].1, kind) == current_class {
+            idx -= 1;
+        }
+
+        Some(Self::column_for_byte_index(text, chars[idx].0))
+    }
+
+    fn move_to_next_word(&mut self, content_width: u16, kind: WordMotionKind) {
+        let start_line = self.cursor_doc_line_for_navigation(content_width);
+        let start_column = self.effective_cursor_column_for_line(start_line);
+
+        for line_index in start_line..self.doc.lines.len() {
+            let text = self.line_text_at(line_index);
+            let column = if line_index == start_line {
+                start_column
+            } else {
+                0
+            };
+            if let Some(next_column) = Self::find_next_word_start(&text, column, kind) {
+                self.cursor_column = next_column;
+                self.cursor_row = self.virtual_row_for_doc_line(line_index, content_width);
+                self.focused_image = None;
+                return;
+            }
+        }
+    }
+
+    fn move_to_prev_word(&mut self, content_width: u16, kind: WordMotionKind) {
+        let start_line = self.cursor_doc_line_for_navigation(content_width);
+        let start_column = self.effective_cursor_column_for_line(start_line);
+
+        for line_index in (0..=start_line).rev() {
+            let text = self.line_text_at(line_index);
+            let column = if line_index == start_line {
+                start_column
+            } else {
+                text.width()
+            };
+            if let Some(prev_column) = Self::find_prev_word_start(&text, column, kind) {
+                self.cursor_column = prev_column;
+                self.cursor_row = self.virtual_row_for_doc_line(line_index, content_width);
+                self.focused_image = None;
+                return;
+            }
+        }
     }
 
     fn search(&mut self, query: &str, viewport_height: usize, content_width: u16) {
@@ -515,6 +682,7 @@ impl App {
         }
 
         let target_row = self.virtual_row_for_doc_line(self.search_matches[0], content_width);
+        self.cursor_row = target_row;
         let max_scroll = self.max_scroll(viewport_height, content_width);
         self.scroll = target_row.min(max_scroll);
         self.status = format!("{} matches for /{query}", self.search_matches.len());
@@ -530,6 +698,7 @@ impl App {
         self.invalidate_highlight_cache();
         let target_row =
             self.virtual_row_for_doc_line(self.search_matches[self.active_match], content_width);
+        self.cursor_row = target_row;
         let max_scroll = self.max_scroll(viewport_height, content_width);
         self.scroll = target_row.min(max_scroll);
     }
@@ -548,6 +717,7 @@ impl App {
         self.invalidate_highlight_cache();
         let target_row =
             self.virtual_row_for_doc_line(self.search_matches[self.active_match], content_width);
+        self.cursor_row = target_row;
         let max_scroll = self.max_scroll(viewport_height, content_width);
         self.scroll = target_row.min(max_scroll);
     }
@@ -1085,27 +1255,19 @@ pub fn run(file_path: PathBuf, start_line: usize, image_protocol: ImageProtocol)
                 let total_rows = display_doc.lines.len().max(1);
                 let total_doc_lines = app.doc.lines.len().max(1);
                 let max_scroll = app.max_scroll(viewport_height, content_width);
+                app.clamp_cursor_row(content_width);
+                app.ensure_cursor_visible(viewport_height, content_width);
                 app.scroll = app.scroll.min(max_scroll);
                 app.request_images_near_viewport(&display_doc, viewport_height);
 
-                let cursor_virtual_row = if viewport_height == 0 {
-                    app.scroll.min(total_rows.saturating_sub(1))
-                } else {
-                    let preferred_cursor_screen_row =
-                        (viewport_height / 2).min(viewport_height.saturating_sub(1));
-                    let max_visible_screen_row = total_rows
-                        .saturating_sub(1)
-                        .saturating_sub(app.scroll)
-                        .min(viewport_height.saturating_sub(1));
-                    app.scroll
-                        .saturating_add(preferred_cursor_screen_row.min(max_visible_screen_row))
-                };
+                let cursor_virtual_row = app.cursor_row.min(total_rows.saturating_sub(1));
                 let cursor_doc_line = display_doc
                     .doc_line_for_row
                     .get(cursor_virtual_row)
                     .copied()
                     .unwrap_or_else(|| app.doc.lines.len().saturating_sub(1));
                 let cursor_screen_row = cursor_virtual_row.saturating_sub(app.scroll);
+                let cursor_column = app.effective_cursor_column_for_line(cursor_doc_line);
 
                 let text = Text::from(std::mem::take(&mut display_doc.lines));
                 let paragraph = Paragraph::new(text)
@@ -1193,7 +1355,7 @@ pub fn run(file_path: PathBuf, start_line: usize, image_protocol: ImageProtocol)
                 }
 
                 let status = if app.show_help {
-                    "q quit | j/k move | g/G top/bottom | d/u,Ctrl-d/u half-page | Ctrl-f/b page | / search | n/N next/prev | r reload | ? help"
+                    "q quit | h/l,j/k move | w/W,b/B words | arrows move | g/G top/bottom | d/u,Ctrl-d/u half-page | Ctrl-f/b page | / search | n/N next/prev | r reload | ? help"
                         .to_string()
                 } else {
                     match &app.mode {
@@ -1206,7 +1368,7 @@ pub fn run(file_path: PathBuf, start_line: usize, image_protocol: ImageProtocol)
                                 app.scroll.saturating_add(1).min(total_rows),
                                 total_rows,
                                 cursor_doc_line.saturating_add(1).min(total_doc_lines),
-                                1
+                                cursor_column.saturating_add(1)
                             );
                             if !app.images.is_empty() {
                                 right.push_str(&format!(
@@ -1254,7 +1416,11 @@ pub fn run(file_path: PathBuf, start_line: usize, image_protocol: ImageProtocol)
                         if viewport_height > 0 && content_inner.width > 0 {
                             let cursor_y =
                                 content_inner.y.saturating_add(cursor_screen_row as u16);
-                            frame.set_cursor_position((content_inner.x, cursor_y));
+                            let cursor_x = content_inner
+                                .x
+                                .saturating_add(cursor_column as u16)
+                                .min(content_inner.x + content_inner.width.saturating_sub(1));
+                            frame.set_cursor_position((cursor_x, cursor_y));
                         }
                     }
                 }
@@ -1361,6 +1527,35 @@ fn handle_key_event(
             app.jump_prev_match(viewport_height, content_width);
             false
         }
+        (KeyCode::Char('w'), mods) if !mods.contains(KeyModifiers::CONTROL) => {
+            app.move_to_next_word(content_width, WordMotionKind::Small);
+            app.ensure_cursor_visible(viewport_height, content_width);
+            false
+        }
+        (KeyCode::Char('W'), mods) if !mods.contains(KeyModifiers::CONTROL) => {
+            app.move_to_next_word(content_width, WordMotionKind::Big);
+            app.ensure_cursor_visible(viewport_height, content_width);
+            false
+        }
+        (KeyCode::Char('b'), mods) if !mods.contains(KeyModifiers::CONTROL) => {
+            app.move_to_prev_word(content_width, WordMotionKind::Small);
+            app.ensure_cursor_visible(viewport_height, content_width);
+            false
+        }
+        (KeyCode::Char('B'), mods) if !mods.contains(KeyModifiers::CONTROL) => {
+            app.move_to_prev_word(content_width, WordMotionKind::Big);
+            app.ensure_cursor_visible(viewport_height, content_width);
+            false
+        }
+        (KeyCode::Char('h'), _) | (KeyCode::Left, _) => {
+            app.move_cursor_left();
+            false
+        }
+        (KeyCode::Char('l'), _) | (KeyCode::Right, _) => {
+            let cursor_doc_line = app.cursor_doc_line_for_navigation(content_width);
+            app.move_cursor_right(cursor_doc_line);
+            false
+        }
         (KeyCode::Char('j'), _) | (KeyCode::Down, _) => {
             app.scroll_down_with_image_focus(viewport_height, content_width);
             false
@@ -1374,7 +1569,7 @@ fn handle_key_event(
             false
         }
         (KeyCode::PageUp, _) => {
-            app.scroll_up(full_page);
+            app.scroll_up(full_page, viewport_height, content_width);
             false
         }
         (KeyCode::Char('f'), KeyModifiers::CONTROL) => {
@@ -1382,7 +1577,7 @@ fn handle_key_event(
             false
         }
         (KeyCode::Char('b'), KeyModifiers::CONTROL) => {
-            app.scroll_up(full_page);
+            app.scroll_up(full_page, viewport_height, content_width);
             false
         }
         (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
@@ -1394,11 +1589,11 @@ fn handle_key_event(
             false
         }
         (KeyCode::Char('u'), KeyModifiers::CONTROL) => {
-            app.scroll_up(half_page);
+            app.scroll_up(half_page, viewport_height, content_width);
             false
         }
         (KeyCode::Char('u'), KeyModifiers::NONE) => {
-            app.scroll_up(half_page);
+            app.scroll_up(half_page, viewport_height, content_width);
             false
         }
         (KeyCode::Char('g'), _) | (KeyCode::Home, _) => {
@@ -1593,6 +1788,8 @@ mod tests {
             search_regex: None,
             search_matches: Vec::new(),
             active_match: 0,
+            cursor_row: 0,
+            cursor_column: 0,
             focused_image: None,
             image_loader_tx,
             image_loader_rx,
@@ -2040,8 +2237,10 @@ mod tests {
     fn scroll_up_saturates() {
         let mut app = test_app(50);
         app.scroll = 10;
-        app.scroll_up(500);
+        app.cursor_row = 10;
+        app.scroll_up(500, 20, 80);
         assert_eq!(app.scroll, 0);
+        assert_eq!(app.cursor_row, 0);
     }
 
     #[test]
@@ -2051,12 +2250,15 @@ mod tests {
         let content_width = 80;
 
         app.scroll = 3;
+        app.cursor_row = 8;
         app.scroll_down_with_image_focus(viewport_height, content_width);
-        assert_eq!(app.scroll, 4);
+        assert_eq!(app.cursor_row, 9);
+        assert_eq!(app.scroll, 3);
         assert_eq!(app.focused_image, Some(0));
 
         app.scroll_down_with_image_focus(viewport_height, content_width);
-        assert_eq!(app.scroll, 14);
+        assert_eq!(app.cursor_row, 19);
+        assert_eq!(app.scroll, 10);
         assert_eq!(app.focused_image, None);
     }
 
@@ -2066,13 +2268,16 @@ mod tests {
         let viewport_height = 10;
         let content_width = 80;
 
-        app.scroll = 14;
+        app.scroll = 10;
+        app.cursor_row = 19;
         app.scroll_up_with_image_focus(viewport_height, content_width);
-        assert_eq!(app.scroll, 13);
+        assert_eq!(app.cursor_row, 18);
+        assert_eq!(app.scroll, 10);
         assert_eq!(app.focused_image, Some(0));
 
         app.scroll_up_with_image_focus(viewport_height, content_width);
-        assert_eq!(app.scroll, 3);
+        assert_eq!(app.cursor_row, 8);
+        assert_eq!(app.scroll, 8);
         assert_eq!(app.focused_image, None);
     }
 
@@ -2085,6 +2290,7 @@ mod tests {
         app.search("keyword", 10, 80);
         assert_eq!(app.search_matches, vec![5, 12]);
         assert_eq!(app.scroll, 5);
+        assert_eq!(app.cursor_row, 5);
     }
 
     #[test]
@@ -2096,6 +2302,7 @@ mod tests {
         app.jump_next_match(10, 80);
         assert_eq!(app.active_match, 0);
         assert_eq!(app.scroll, 3);
+        assert_eq!(app.cursor_row, 3);
     }
 
     #[test]
@@ -2191,6 +2398,148 @@ mod tests {
             full_page,
         );
         assert_eq!(app.scroll, 0);
+    }
+
+    #[test]
+    fn h_and_l_move_cursor_column_within_current_line() {
+        let mut app = test_app(20);
+        app.scroll = 1;
+        app.cursor_row = 10;
+        let viewport_height = 20;
+        let full_page = 20;
+        let half_page = 10;
+        let cursor_doc_line = app.cursor_doc_line_for_navigation(80);
+        app.doc.lines[cursor_doc_line] = Line::from("abcdef");
+
+        let _ = handle_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE),
+            viewport_height,
+            80,
+            half_page,
+            full_page,
+        );
+        let _ = handle_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+            viewport_height,
+            80,
+            half_page,
+            full_page,
+        );
+        assert_eq!(app.cursor_column, 2);
+
+        let _ = handle_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE),
+            viewport_height,
+            80,
+            half_page,
+            full_page,
+        );
+        assert_eq!(app.cursor_column, 1);
+    }
+
+    #[test]
+    fn cursor_column_clamps_to_line_width() {
+        let mut app = test_app(20);
+        app.scroll = 1;
+        app.cursor_row = 10;
+        let viewport_height = 20;
+        let full_page = 20;
+        let half_page = 10;
+        let cursor_doc_line = app.cursor_doc_line_for_navigation(80);
+        app.doc.lines[cursor_doc_line] = Line::from("abc");
+
+        for _ in 0..10 {
+            let _ = handle_key_event(
+                &mut app,
+                KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE),
+                viewport_height,
+                80,
+                half_page,
+                full_page,
+            );
+        }
+
+        assert_eq!(app.cursor_column, 2);
+        assert_eq!(app.effective_cursor_column_for_line(cursor_doc_line), 2);
+    }
+
+    #[test]
+    fn initial_cursor_starts_at_top_of_document() {
+        let app = test_app(20);
+        assert_eq!(app.scroll, 0);
+        assert_eq!(app.cursor_row, 0);
+        assert_eq!(app.cursor_column, 0);
+    }
+
+    #[test]
+    fn w_and_b_move_by_small_words() {
+        let mut app = test_app(5);
+        app.doc.lines[0] = Line::from("alpha, beta gamma");
+        let viewport_height = 10;
+        let full_page = 10;
+        let half_page = 5;
+
+        let _ = handle_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE),
+            viewport_height,
+            80,
+            half_page,
+            full_page,
+        );
+        assert_eq!(app.cursor_column, 5);
+
+        let _ = handle_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE),
+            viewport_height,
+            80,
+            half_page,
+            full_page,
+        );
+        assert_eq!(app.cursor_column, 7);
+
+        let _ = handle_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE),
+            viewport_height,
+            80,
+            half_page,
+            full_page,
+        );
+        assert_eq!(app.cursor_column, 5);
+    }
+
+    #[test]
+    fn big_word_motions_move_across_whitespace_delimited_words() {
+        let mut app = test_app(5);
+        app.doc.lines[0] = Line::from("alpha, beta gamma");
+        let viewport_height = 10;
+        let full_page = 10;
+        let half_page = 5;
+
+        let _ = handle_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('W'), KeyModifiers::SHIFT),
+            viewport_height,
+            80,
+            half_page,
+            full_page,
+        );
+        assert_eq!(app.cursor_column, 7);
+
+        let _ = handle_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('B'), KeyModifiers::SHIFT),
+            viewport_height,
+            80,
+            half_page,
+            full_page,
+        );
+        assert_eq!(app.cursor_column, 0);
     }
 
     #[test]
