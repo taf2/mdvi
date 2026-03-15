@@ -8,6 +8,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use arboard::Clipboard;
 use crossterm::{
     event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     execute,
@@ -106,6 +107,18 @@ struct ImageVirtualBounds {
     end_row: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CursorPosition {
+    row: usize,
+    column: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VisualBlockSelection {
+    start: CursorPosition,
+    end: CursorPosition,
+}
+
 #[derive(Debug, Clone)]
 enum ResolvedImageSource {
     Local(PathBuf),
@@ -183,6 +196,7 @@ enum Mode {
     #[default]
     Normal,
     SearchInput(String),
+    VisualBlock(CursorPosition),
 }
 
 impl App {
@@ -489,17 +503,80 @@ impl App {
             .unwrap_or_default()
     }
 
-    fn line_width_at(&self, index: usize) -> usize {
-        self.line_text_at(index).width()
+    fn visible_line_width_at(&self, index: usize) -> usize {
+        self.line_text_at(index).trim_end().width()
     }
 
     fn max_cursor_column_for_line(&self, index: usize) -> usize {
-        self.line_width_at(index).saturating_sub(1)
+        self.visible_line_width_at(index).saturating_sub(1)
     }
 
     fn effective_cursor_column_for_line(&self, index: usize) -> usize {
         self.cursor_column
             .min(self.max_cursor_column_for_line(index))
+    }
+
+    fn current_cursor_position(&mut self, content_width: u16) -> CursorPosition {
+        let line_index = self.cursor_doc_line_for_navigation(content_width);
+        CursorPosition {
+            row: self.cursor_row,
+            column: self.effective_cursor_column_for_line(line_index),
+        }
+    }
+
+    fn visual_block_selection(&mut self, content_width: u16) -> Option<VisualBlockSelection> {
+        let Mode::VisualBlock(anchor) = &self.mode else {
+            return None;
+        };
+
+        Some(VisualBlockSelection {
+            start: *anchor,
+            end: self.current_cursor_position(content_width),
+        })
+    }
+
+    fn apply_visual_selection_to_display_doc(
+        &mut self,
+        display_doc: &mut DisplayDoc,
+        content_width: u16,
+    ) {
+        let Some(selection) = self.visual_block_selection(content_width) else {
+            return;
+        };
+
+        let row_start = selection.start.row.min(selection.end.row);
+        let row_end = selection.start.row.max(selection.end.row);
+        let col_start = selection.start.column.min(selection.end.column);
+        let col_end = selection
+            .start
+            .column
+            .max(selection.end.column)
+            .saturating_add(1);
+        let highlight_style = Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD);
+
+        for row in row_start..=row_end {
+            let Some(line) = display_doc.lines.get_mut(row) else {
+                continue;
+            };
+            let line_text = line_plain_text(line);
+            let visible_text = line_text.trim_end_matches(char::is_whitespace);
+            if visible_text.is_empty() {
+                continue;
+            }
+
+            let visible_width = visible_text.width();
+            if col_start >= visible_width {
+                continue;
+            }
+
+            let start_byte = Self::byte_index_for_column(visible_text, col_start);
+            let end_byte = Self::byte_index_for_column(visible_text, col_end.min(visible_width));
+            if end_byte <= start_byte {
+                continue;
+            }
+
+            *line = apply_highlight_ranges(line, &[(start_byte, end_byte)], highlight_style);
+        }
     }
 
     fn move_cursor_left(&mut self) {
@@ -641,6 +718,63 @@ impl App {
                 self.cursor_row = self.virtual_row_for_doc_line(line_index, content_width);
                 self.focused_image = None;
                 return;
+            }
+        }
+    }
+
+    fn visual_selection_text(&mut self, content_width: u16) -> Option<String> {
+        let selection = self.visual_block_selection(content_width)?;
+        let display_doc = self.build_display_doc(content_width);
+        let row_start = selection.start.row.min(selection.end.row);
+        let row_end = selection.start.row.max(selection.end.row);
+        let col_start = selection.start.column.min(selection.end.column);
+        let col_end = selection
+            .start
+            .column
+            .max(selection.end.column)
+            .saturating_add(1);
+        let mut lines = Vec::new();
+
+        for row in row_start..=row_end {
+            let Some(line) = display_doc.lines.get(row) else {
+                continue;
+            };
+            let text = line_plain_text(line);
+            let visible_text = text.trim_end_matches(char::is_whitespace);
+            if visible_text.is_empty() {
+                lines.push(String::new());
+                continue;
+            }
+
+            let visible_width = visible_text.width();
+            if col_start >= visible_width {
+                lines.push(String::new());
+                continue;
+            }
+
+            let start_byte = Self::byte_index_for_column(visible_text, col_start);
+            let end_byte = Self::byte_index_for_column(visible_text, col_end.min(visible_width));
+            lines.push(visible_text[start_byte..end_byte].to_string());
+        }
+
+        Some(lines.join("\n"))
+    }
+
+    fn copy_visual_selection_to_clipboard(&mut self, content_width: u16) {
+        let Some(selection_text) = self.visual_selection_text(content_width) else {
+            self.status = "no active visual selection".to_string();
+            return;
+        };
+
+        match Clipboard::new().and_then(|mut clipboard| clipboard.set_text(selection_text.clone()))
+        {
+            Ok(()) => {
+                let line_count = selection_text.lines().count().max(1);
+                self.status = format!("copied {line_count} selected line(s) to clipboard");
+                self.mode = Mode::Normal;
+            }
+            Err(err) => {
+                self.status = format!("clipboard copy failed: {err}");
             }
         }
     }
@@ -1269,6 +1403,7 @@ pub fn run(file_path: PathBuf, start_line: usize, image_protocol: ImageProtocol)
                 let cursor_screen_row = cursor_virtual_row.saturating_sub(app.scroll);
                 let cursor_column = app.effective_cursor_column_for_line(cursor_doc_line);
 
+                app.apply_visual_selection_to_display_doc(&mut display_doc, content_width);
                 let text = Text::from(std::mem::take(&mut display_doc.lines));
                 let paragraph = Paragraph::new(text)
                     .block(content_block)
@@ -1355,7 +1490,7 @@ pub fn run(file_path: PathBuf, start_line: usize, image_protocol: ImageProtocol)
                 }
 
                 let status = if app.show_help {
-                    "q quit | h/l,j/k move | w/W,b/B words | arrows move | g/G top/bottom | d/u,Ctrl-d/u half-page | Ctrl-f/b page | / search | n/N next/prev | r reload | ? help"
+                    "q quit | Ctrl-v visual block | y copy | Esc cancel | h/l,j/k move | w/W,b/B words | g/G top/bottom | d/u,Ctrl-d/u half-page | Ctrl-f/b page | / search | n/N next/prev | r reload | ? help"
                         .to_string()
                 } else {
                     match &app.mode {
@@ -1392,6 +1527,25 @@ pub fn run(file_path: PathBuf, start_line: usize, image_protocol: ImageProtocol)
                             right
                         }
                         Mode::SearchInput(query) => format!("/{query}"),
+                        Mode::VisualBlock(_) => {
+                            let (loaded_images, loading_images, failed_images) =
+                                app.image_progress_counts();
+                            let mut right = format!(
+                                "{}  |  VISUAL BLOCK  |  row {} / {}  |  cursor {}:{}  |  y copy | Esc cancel",
+                                app.status,
+                                app.scroll.saturating_add(1).min(total_rows),
+                                total_rows,
+                                cursor_doc_line.saturating_add(1).min(total_doc_lines),
+                                cursor_column.saturating_add(1)
+                            );
+                            if !app.images.is_empty() {
+                                right.push_str(&format!(
+                                    "  |  images {loaded_images}/{}, loading {loading_images}, failed {failed_images}",
+                                    app.images.len()
+                                ));
+                            }
+                            right
+                        }
                     }
                 };
 
@@ -1412,7 +1566,7 @@ pub fn run(file_path: PathBuf, start_line: usize, image_protocol: ImageProtocol)
                             .min(max_x);
                         frame.set_cursor_position((cursor_x, chunks[1].y));
                     }
-                    Mode::Normal => {
+                    Mode::Normal | Mode::VisualBlock(_) => {
                         if viewport_height > 0 && content_inner.width > 0 {
                             let cursor_y =
                                 content_inner.y.saturating_add(cursor_screen_row as u16);
@@ -1505,10 +1659,37 @@ fn handle_key_event(
         return false;
     }
 
+    if matches!(app.mode, Mode::VisualBlock(_)) {
+        match (key.code, key.modifiers) {
+            (KeyCode::Esc, _) => {
+                app.mode = Mode::Normal;
+                app.status = "visual selection cleared".to_string();
+                return false;
+            }
+            (KeyCode::Char('v'), KeyModifiers::CONTROL) => {
+                app.mode = Mode::Normal;
+                app.status = "visual selection cleared".to_string();
+                return false;
+            }
+            (KeyCode::Char('y'), mods) if !mods.contains(KeyModifiers::CONTROL) => {
+                app.copy_visual_selection_to_clipboard(content_width);
+                return false;
+            }
+            _ => {}
+        }
+    }
+
     match (key.code, key.modifiers) {
         (KeyCode::Char('q'), _) => true,
+        (KeyCode::Esc, _) => false,
         (KeyCode::Char('?'), _) => {
             app.show_help = !app.show_help;
+            false
+        }
+        (KeyCode::Char('v'), KeyModifiers::CONTROL) => {
+            let anchor = app.current_cursor_position(content_width);
+            app.mode = Mode::VisualBlock(anchor);
+            app.status = "visual block selection started".to_string();
             false
         }
         (KeyCode::Char('r'), _) => {
@@ -1801,10 +1982,7 @@ mod tests {
     }
 
     fn line_text(line: &Line<'static>) -> String {
-        line.spans
-            .iter()
-            .map(|span| span.content.as_ref())
-            .collect::<String>()
+        line_plain_text(line)
     }
 
     fn app_with_image_for_navigation() -> App {
@@ -2543,6 +2721,45 @@ mod tests {
     }
 
     #[test]
+    fn cursor_clamps_to_visible_end_of_line_without_trailing_whitespace() {
+        let mut app = test_app(5);
+        app.doc.lines[0] = Line::from("alpha      ");
+        let viewport_height = 10;
+        let full_page = 10;
+        let half_page = 5;
+
+        for _ in 0..16 {
+            let _ = handle_key_event(
+                &mut app,
+                KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE),
+                viewport_height,
+                80,
+                half_page,
+                full_page,
+            );
+        }
+
+        assert_eq!(app.cursor_column, 4);
+        assert_eq!(app.effective_cursor_column_for_line(0), 4);
+    }
+
+    #[test]
+    fn visual_block_selection_extracts_rectangular_text() {
+        let mut app = test_app(3);
+        app.doc.lines[0] = Line::from("alpha beta");
+        app.doc.lines[1] = Line::from("bravo beta");
+        app.cursor_row = 1;
+        app.cursor_column = 3;
+        app.mode = Mode::VisualBlock(CursorPosition { row: 0, column: 1 });
+
+        let selected = app
+            .visual_selection_text(80)
+            .expect("visual selection text should exist");
+
+        assert_eq!(selected, "lph\nrav");
+    }
+
+    #[test]
     fn search_highlight_applies_reverse_modifier() {
         let regex = RegexBuilder::new(&regex::escape("mdvi"))
             .case_insensitive(true)
@@ -2662,6 +2879,13 @@ mod tests {
     }
 }
 
+fn line_plain_text(line: &Line<'_>) -> String {
+    line.spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect::<String>()
+}
+
 fn highlight_lines(
     lines: &[Line<'static>],
     regex: &Regex,
@@ -2671,11 +2895,7 @@ fn highlight_lines(
         .iter()
         .enumerate()
         .map(|(idx, line)| {
-            let line_text = line
-                .spans
-                .iter()
-                .map(|span| span.content.as_ref())
-                .collect::<String>();
+            let line_text = line_plain_text(line);
             let ranges = regex
                 .find_iter(&line_text)
                 .map(|m| (m.start(), m.end()))
