@@ -39,6 +39,7 @@ type AppTerminal = Terminal<CrosstermBackend<Stdout>>;
 const DEFAULT_IMAGE_HINT_PIXEL_SIZE: (u32, u32) = (900, 500);
 const IMAGE_PRELOAD_VIEWPORTS: usize = 2;
 const MAX_IMAGE_RESULTS_PER_TICK: usize = 4;
+const MAX_CACHED_IMAGE_VARIANTS: usize = 24;
 
 struct App {
     file_path: PathBuf,
@@ -68,7 +69,11 @@ struct InlineImage {
     line_index: usize,
     source: Option<ResolvedImageSource>,
     state: Option<StatefulProtocol>,
+    scratch_state: Option<StatefulProtocol>,
+    active_variant: Option<ImageResizeVariant>,
+    cached_variants: BTreeMap<ImageResizeVariant, StatefulProtocol>,
     resize_pending: bool,
+    pending_variant: Option<ImageResizeVariant>,
     has_encoded_state: bool,
     pixel_size: Option<(u32, u32)>,
     hinted_pixel_size: Option<(u32, u32)>,
@@ -139,6 +144,7 @@ enum ImageLoadResultPayload {
 
 struct ImageResizeRequest {
     image_index: usize,
+    variant: ImageResizeVariant,
     resize: Resize,
     area: Rect,
     protocol: StatefulProtocol,
@@ -146,7 +152,22 @@ struct ImageResizeRequest {
 
 struct ImageResizeResult {
     image_index: usize,
+    variant: ImageResizeVariant,
     protocol: StatefulProtocol,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ImageResizeMode {
+    Fit,
+    Crop { clip_top: bool, clip_left: bool },
+    Scale,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct ImageResizeVariant {
+    width: u16,
+    height: u16,
+    mode: ImageResizeMode,
 }
 
 #[derive(Debug, Default)]
@@ -650,6 +671,11 @@ impl App {
 
         let Some(source) = image.source.clone() else {
             image.resize_pending = false;
+            image.pending_variant = None;
+            image.active_variant = None;
+            image.cached_variants.clear();
+            image.scratch_state = None;
+            image.state = None;
             image.load_state = ImageLoadState::Failed;
             return;
         };
@@ -663,10 +689,20 @@ impl App {
             .is_ok()
         {
             image.resize_pending = false;
+            image.pending_variant = None;
+            image.active_variant = None;
+            image.cached_variants.clear();
+            image.scratch_state = None;
+            image.state = None;
             image.has_encoded_state = false;
             image.load_state = ImageLoadState::Loading;
         } else {
             image.resize_pending = false;
+            image.pending_variant = None;
+            image.active_variant = None;
+            image.cached_variants.clear();
+            image.scratch_state = None;
+            image.state = None;
             image.has_encoded_state = false;
             image.load_state = ImageLoadState::Failed;
         }
@@ -710,38 +746,145 @@ impl App {
         }
     }
 
+    fn image_resize_variant(resize: &Resize, target_area: Rect) -> ImageResizeVariant {
+        let mode = match resize {
+            Resize::Fit(_) => ImageResizeMode::Fit,
+            Resize::Crop(options) => {
+                let options = options.unwrap_or(CropOptions {
+                    clip_top: false,
+                    clip_left: false,
+                });
+                ImageResizeMode::Crop {
+                    clip_top: options.clip_top,
+                    clip_left: options.clip_left,
+                }
+            }
+            Resize::Scale(_) => ImageResizeMode::Scale,
+        };
+
+        ImageResizeVariant {
+            width: target_area.width,
+            height: target_area.height,
+            mode,
+        }
+    }
+
+    fn insert_cached_variant(
+        image: &mut InlineImage,
+        variant: ImageResizeVariant,
+        protocol: StatefulProtocol,
+    ) {
+        image.cached_variants.insert(variant, protocol);
+        while image.cached_variants.len() > MAX_CACHED_IMAGE_VARIANTS {
+            let Some(evict_variant) = image.cached_variants.keys().next().copied() else {
+                break;
+            };
+            image.cached_variants.remove(&evict_variant);
+        }
+    }
+
+    fn activate_cached_variant(image: &mut InlineImage, variant: ImageResizeVariant) -> bool {
+        let Some(next_protocol) = image.cached_variants.remove(&variant) else {
+            return false;
+        };
+
+        let previous_protocol = image.state.replace(next_protocol);
+        let previous_variant = image.active_variant;
+        image.active_variant = Some(variant);
+        image.has_encoded_state = true;
+
+        if let Some(previous_protocol) = previous_protocol {
+            if let Some(previous_variant) = previous_variant {
+                Self::insert_cached_variant(image, previous_variant, previous_protocol);
+            } else if image.scratch_state.is_none() {
+                image.scratch_state = Some(previous_protocol);
+            }
+        }
+
+        true
+    }
+
+    fn requested_variant(
+        &self,
+        image_index: usize,
+        area: Rect,
+        resize: &Resize,
+    ) -> Option<ImageResizeVariant> {
+        let image = self.images.get(image_index)?;
+        let reference_protocol = image
+            .state
+            .as_ref()
+            .or_else(|| image.scratch_state.as_ref())
+            .or_else(|| image.cached_variants.values().next())?;
+
+        let target_area = reference_protocol.size_for(resize.clone(), area);
+        if target_area.width == 0 || target_area.height == 0 {
+            return None;
+        }
+
+        Some(Self::image_resize_variant(resize, target_area))
+    }
+
     fn request_image_resize(&mut self, image_index: usize, area: Rect, resize: Resize) {
         let Some(image) = self.images.get_mut(image_index) else {
             return;
         };
-        if image.resize_pending {
-            return;
-        }
-
-        let Some(target_area) = image
+        let Some(reference_protocol) = image
             .state
             .as_ref()
-            .and_then(|state| state.needs_resize(&resize, area))
+            .or_else(|| image.scratch_state.as_ref())
+            .or_else(|| image.cached_variants.values().next())
         else {
             return;
         };
+        let target_area = reference_protocol.size_for(resize.clone(), area);
+        if target_area.width == 0 || target_area.height == 0 {
+            return;
+        }
+        let variant = Self::image_resize_variant(&resize, target_area);
 
-        let Some(protocol) = image.state.take() else {
+        if image.state.is_some() && image.active_variant == Some(variant) {
+            return;
+        }
+        if Self::activate_cached_variant(image, variant) {
+            return;
+        }
+        if image.pending_variant == Some(variant) || image.resize_pending {
+            return;
+        }
+
+        let protocol = if let Some(protocol) = image.scratch_state.take() {
+            Some(protocol)
+        } else if let Some(cached_variant) = image.cached_variants.keys().next().copied() {
+            image.cached_variants.remove(&cached_variant)
+        } else if image.active_variant.is_none() {
+            image.state.take()
+        } else {
+            None
+        };
+        let Some(protocol) = protocol else {
             return;
         };
 
         match self.image_resize_tx.send(ImageResizeRequest {
             image_index,
+            variant,
             resize,
             area: target_area,
             protocol,
         }) {
             Ok(()) => {
                 image.resize_pending = true;
+                image.pending_variant = Some(variant);
             }
             Err(err) => {
-                image.state = Some(err.0.protocol);
+                if image.scratch_state.is_none() {
+                    image.scratch_state = Some(err.0.protocol);
+                } else if image.state.is_none() {
+                    image.state = Some(err.0.protocol);
+                }
                 image.resize_pending = false;
+                image.pending_variant = None;
             }
         }
     }
@@ -752,9 +895,26 @@ impl App {
             let Some(image) = self.images.get_mut(result.image_index) else {
                 continue;
             };
-            image.state = Some(result.protocol);
+            let was_pending_variant = image.pending_variant == Some(result.variant);
             image.resize_pending = false;
+            image.pending_variant = None;
             image.has_encoded_state = true;
+
+            if was_pending_variant || image.active_variant.is_none() {
+                let previous_protocol = image.state.replace(result.protocol);
+                let previous_variant = image.active_variant;
+                image.active_variant = Some(result.variant);
+
+                if let Some(previous_protocol) = previous_protocol {
+                    if let Some(previous_variant) = previous_variant {
+                        Self::insert_cached_variant(image, previous_variant, previous_protocol);
+                    } else if image.scratch_state.is_none() {
+                        image.scratch_state = Some(previous_protocol);
+                    }
+                }
+            } else {
+                Self::insert_cached_variant(image, result.variant, result.protocol);
+            }
             changed = true;
         }
         changed
@@ -788,16 +948,24 @@ impl App {
             match result.payload {
                 ImageLoadResultPayload::LoadedImage(Some(dynamic_image)) => {
                     image.pixel_size = Some((dynamic_image.width(), dynamic_image.height()));
-                    image.state = Some(self.picker.new_resize_protocol(dynamic_image));
+                    image.state = Some(self.picker.new_resize_protocol(dynamic_image.clone()));
+                    image.scratch_state = Some(self.picker.new_resize_protocol(dynamic_image));
+                    image.active_variant = None;
+                    image.cached_variants.clear();
                     image.resize_pending = false;
+                    image.pending_variant = None;
                     image.has_encoded_state = false;
                     image.load_state = ImageLoadState::Loaded;
                     changed = true;
                 }
                 ImageLoadResultPayload::LoadedImage(None) => {
-                    image.resize_pending = false;
-                    image.has_encoded_state = false;
                     image.state = None;
+                    image.scratch_state = None;
+                    image.active_variant = None;
+                    image.cached_variants.clear();
+                    image.resize_pending = false;
+                    image.pending_variant = None;
+                    image.has_encoded_state = false;
                     image.load_state = ImageLoadState::Failed;
                     changed = true;
                 }
@@ -976,20 +1144,33 @@ pub fn run(file_path: PathBuf, start_line: usize, image_protocol: ImageProtocol)
                         continue;
                     }
                     frame.render_widget(Clear, image_area);
-                    if is_fully_visible {
-                        app.request_image_resize(plan.image_index, image_area, Resize::Fit(None));
+                    let resize = if is_fully_visible {
+                        Resize::Fit(None)
                     } else {
-                        app.request_image_resize(
-                            plan.image_index,
-                            image_area,
-                            Resize::Crop(Some(CropOptions {
-                                clip_top: visible_top > plan_top,
-                                clip_left: false,
-                            })),
-                        );
-                    }
-                    if let Some(image_state) = app.images[plan.image_index].state.as_mut() {
-                        image_state.render(image_area, frame.buffer_mut());
+                        Resize::Crop(Some(CropOptions {
+                            clip_top: visible_top > plan_top,
+                            clip_left: false,
+                        }))
+                    };
+                    let requested_variant =
+                        app.requested_variant(plan.image_index, image_area, &resize);
+                    app.request_image_resize(plan.image_index, image_area, resize);
+                    let has_requested_variant = requested_variant
+                        .is_some_and(|variant| app.images[plan.image_index].active_variant == Some(variant));
+
+                    if has_requested_variant {
+                        if let Some(image_state) = app.images[plan.image_index].state.as_mut() {
+                            image_state.render(image_area, frame.buffer_mut());
+                        } else {
+                            let placeholder = App::image_placeholder(&app.images[plan.image_index]);
+                            frame.render_widget(
+                                Paragraph::new(Line::from(Span::styled(
+                                    format!("  {placeholder}"),
+                                    Style::default().add_modifier(Modifier::DIM),
+                                ))),
+                                image_area,
+                            );
+                        }
                     } else {
                         let placeholder = App::image_placeholder(&app.images[plan.image_index]);
                         frame.render_widget(
@@ -1247,7 +1428,11 @@ fn prepare_images_for_doc(markdown_path: &Path, doc: &RenderedDoc) -> Vec<Inline
                 line_index: image.line_index,
                 source,
                 state: None,
+                scratch_state: None,
+                active_variant: None,
+                cached_variants: BTreeMap::new(),
                 resize_pending: false,
+                pending_variant: None,
                 has_encoded_state: false,
                 pixel_size: None,
                 hinted_pixel_size: image.hinted_pixel_size,
@@ -1318,6 +1503,7 @@ fn image_resize_worker(
         if result_tx
             .send(ImageResizeResult {
                 image_index: request.image_index,
+                variant: request.variant,
                 protocol: request.protocol,
             })
             .is_err()
@@ -1432,7 +1618,11 @@ mod tests {
                 "https://example.com/image.png".to_string(),
             )),
             state: None,
+            scratch_state: None,
+            active_variant: None,
+            cached_variants: BTreeMap::new(),
             resize_pending: false,
+            pending_variant: None,
             has_encoded_state: false,
             pixel_size: None,
             hinted_pixel_size: Some((160, 160)),
@@ -1483,7 +1673,11 @@ mod tests {
                 "https://example.com/image.png".to_string(),
             )),
             state: None,
+            scratch_state: None,
+            active_variant: None,
+            cached_variants: BTreeMap::new(),
             resize_pending: false,
+            pending_variant: None,
             has_encoded_state: false,
             pixel_size: None,
             hinted_pixel_size: None,
@@ -1520,7 +1714,11 @@ mod tests {
                     "/tmp/image-a.png",
                 ))),
                 state: None,
+                scratch_state: None,
+                active_variant: None,
+                cached_variants: BTreeMap::new(),
                 resize_pending: false,
+                pending_variant: None,
                 has_encoded_state: false,
                 pixel_size: None,
                 hinted_pixel_size: None,
@@ -1532,7 +1730,11 @@ mod tests {
                     "https://example.com/image-b.png".to_string(),
                 )),
                 state: None,
+                scratch_state: None,
+                active_variant: None,
+                cached_variants: BTreeMap::new(),
                 resize_pending: false,
+                pending_variant: None,
                 has_encoded_state: false,
                 pixel_size: None,
                 hinted_pixel_size: None,
@@ -1567,7 +1769,11 @@ mod tests {
                 "/tmp/image-c.png",
             ))),
             state: None,
+            scratch_state: None,
+            active_variant: None,
+            cached_variants: BTreeMap::new(),
             resize_pending: false,
+            pending_variant: None,
             has_encoded_state: false,
             pixel_size: None,
             hinted_pixel_size: None,
@@ -1602,7 +1808,11 @@ mod tests {
                     "https://example.com/image.png".to_string(),
                 )),
                 state: None,
+                scratch_state: None,
+                active_variant: None,
+                cached_variants: BTreeMap::new(),
                 resize_pending: false,
+                pending_variant: None,
                 has_encoded_state: false,
                 pixel_size: None,
                 hinted_pixel_size: None,
@@ -1645,7 +1855,14 @@ mod tests {
                 app.picker
                     .new_resize_protocol(image::DynamicImage::new_rgb8(320, 200)),
             ),
+            scratch_state: Some(
+                app.picker
+                    .new_resize_protocol(image::DynamicImage::new_rgb8(320, 200)),
+            ),
+            active_variant: None,
+            cached_variants: BTreeMap::new(),
             resize_pending: false,
+            pending_variant: None,
             has_encoded_state: false,
             pixel_size: Some((320, 200)),
             hinted_pixel_size: None,
@@ -1656,7 +1873,15 @@ mod tests {
         app.request_image_resize(0, Rect::new(0, 0, 40, 10), Resize::Fit(None));
 
         assert!(app.images[0].resize_pending);
-        assert!(app.images[0].state.is_none());
+        assert!(app.images[0].state.is_some());
+        assert_eq!(
+            app.images[0].pending_variant,
+            Some(ImageResizeVariant {
+                width: 32,
+                height: 10,
+                mode: ImageResizeMode::Fit,
+            })
+        );
         let request = resize_request_rx
             .try_recv()
             .expect("resize request should be queued");
@@ -1674,7 +1899,15 @@ mod tests {
                 "https://example.com/image.png".to_string(),
             )),
             state: None,
+            scratch_state: None,
+            active_variant: None,
+            cached_variants: BTreeMap::new(),
             resize_pending: true,
+            pending_variant: Some(ImageResizeVariant {
+                width: 40,
+                height: 10,
+                mode: ImageResizeMode::Fit,
+            }),
             has_encoded_state: true,
             pixel_size: Some((320, 200)),
             hinted_pixel_size: None,
@@ -1686,6 +1919,11 @@ mod tests {
         resize_result_tx
             .send(ImageResizeResult {
                 image_index: 0,
+                variant: ImageResizeVariant {
+                    width: 40,
+                    height: 10,
+                    mode: ImageResizeMode::Fit,
+                },
                 protocol: app
                     .picker
                     .new_resize_protocol(image::DynamicImage::new_rgb8(320, 200)),
@@ -1695,6 +1933,107 @@ mod tests {
         assert!(app.drain_image_resize_results());
         assert!(!app.images[0].resize_pending);
         assert!(app.images[0].state.is_some());
+    }
+
+    #[test]
+    fn request_image_resize_uses_cached_variant_without_queueing() {
+        let (image_resize_tx, resize_request_rx) = mpsc::channel::<ImageResizeRequest>();
+        let mut app = test_app(1);
+        let cached_variant = ImageResizeVariant {
+            width: 32,
+            height: 10,
+            mode: ImageResizeMode::Fit,
+        };
+        app.images = vec![InlineImage {
+            line_index: 0,
+            source: Some(ResolvedImageSource::Remote(
+                "https://example.com/image.png".to_string(),
+            )),
+            state: Some(
+                app.picker
+                    .new_resize_protocol(image::DynamicImage::new_rgb8(320, 200)),
+            ),
+            scratch_state: Some(
+                app.picker
+                    .new_resize_protocol(image::DynamicImage::new_rgb8(320, 200)),
+            ),
+            active_variant: None,
+            cached_variants: BTreeMap::from([(
+                cached_variant,
+                app.picker
+                    .new_resize_protocol(image::DynamicImage::new_rgb8(320, 200)),
+            )]),
+            resize_pending: false,
+            pending_variant: None,
+            has_encoded_state: false,
+            pixel_size: Some((320, 200)),
+            hinted_pixel_size: None,
+            load_state: ImageLoadState::Loaded,
+        }];
+        app.image_resize_tx = image_resize_tx;
+
+        app.request_image_resize(0, Rect::new(0, 0, 40, 10), Resize::Fit(None));
+
+        assert_eq!(app.images[0].active_variant, Some(cached_variant));
+        assert!(app.images[0].state.is_some());
+        assert!(resize_request_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn resize_result_for_pending_variant_becomes_active_immediately() {
+        let (image_resize_tx, _resize_request_rx) = mpsc::channel::<ImageResizeRequest>();
+        let (resize_result_tx, image_resize_rx) = mpsc::channel::<ImageResizeResult>();
+        let mut app = test_app(1);
+        let previous_variant = ImageResizeVariant {
+            width: 32,
+            height: 10,
+            mode: ImageResizeMode::Fit,
+        };
+        let pending_variant = ImageResizeVariant {
+            width: 32,
+            height: 9,
+            mode: ImageResizeMode::Crop {
+                clip_top: true,
+                clip_left: false,
+            },
+        };
+        app.images = vec![InlineImage {
+            line_index: 0,
+            source: Some(ResolvedImageSource::Remote(
+                "https://example.com/image.png".to_string(),
+            )),
+            state: Some(
+                app.picker
+                    .new_resize_protocol(image::DynamicImage::new_rgb8(320, 200)),
+            ),
+            scratch_state: None,
+            active_variant: Some(previous_variant),
+            cached_variants: BTreeMap::new(),
+            resize_pending: true,
+            pending_variant: Some(pending_variant),
+            has_encoded_state: true,
+            pixel_size: Some((320, 200)),
+            hinted_pixel_size: None,
+            load_state: ImageLoadState::Loaded,
+        }];
+        app.image_resize_tx = image_resize_tx;
+        app.image_resize_rx = image_resize_rx;
+
+        resize_result_tx
+            .send(ImageResizeResult {
+                image_index: 0,
+                variant: pending_variant,
+                protocol: app
+                    .picker
+                    .new_resize_protocol(image::DynamicImage::new_rgb8(320, 200)),
+            })
+            .expect("resize result should enqueue");
+
+        assert!(app.drain_image_resize_results());
+        assert_eq!(app.images[0].active_variant, Some(pending_variant));
+        assert!(app.images[0]
+            .cached_variants
+            .contains_key(&previous_variant));
     }
 
     #[test]
@@ -1936,7 +2275,11 @@ mod tests {
                 "https://example.com/image.png".to_string(),
             )),
             state: None,
+            scratch_state: None,
+            active_variant: None,
+            cached_variants: BTreeMap::new(),
             resize_pending: false,
+            pending_variant: None,
             has_encoded_state: false,
             pixel_size: None,
             hinted_pixel_size: Some((1708, 1040)),
@@ -1955,7 +2298,11 @@ mod tests {
                 "https://example.com/image.png".to_string(),
             )),
             state: None,
+            scratch_state: None,
+            active_variant: None,
+            cached_variants: BTreeMap::new(),
             resize_pending: false,
+            pending_variant: None,
             has_encoded_state: false,
             pixel_size: None,
             hinted_pixel_size: None,
