@@ -1,6 +1,6 @@
 [package]
 name = "mdvi"
-version = "0.6.4"
+version = "0.6.5"
 edition = "2021"
 description = "Professional markdown viewer for the terminal with Vim-style navigation"
 license = "MIT"
