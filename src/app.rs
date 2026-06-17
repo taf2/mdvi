@@ -1118,7 +1118,7 @@ impl App {
         let reference_protocol = image
             .state
             .as_ref()
-            .or_else(|| image.scratch_state.as_ref())
+            .or(image.scratch_state.as_ref())
             .or_else(|| image.cached_variants.values().next())?;
 
         let target_area = reference_protocol.size_for(resize.clone(), area);
@@ -1136,7 +1136,7 @@ impl App {
         let Some(reference_protocol) = image
             .state
             .as_ref()
-            .or_else(|| image.scratch_state.as_ref())
+            .or(image.scratch_state.as_ref())
             .or_else(|| image.cached_variants.values().next())
         else {
             return;
