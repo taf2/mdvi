@@ -257,11 +257,10 @@ pub fn render_markdown(input: &str) -> Result<RenderedDoc> {
                 }
                 Tag::TableHead => {}
                 Tag::TableRow => {}
-                Tag::TableCell => {
-                    if !current_spans.is_empty() {
-                        current_spans.push(Span::raw(" │ ".to_string()));
-                    }
+                Tag::TableCell if !current_spans.is_empty() => {
+                    current_spans.push(Span::raw(" │ ".to_string()));
                 }
+                Tag::TableCell => {}
                 Tag::FootnoteDefinition(name) => {
                     blank_line(&mut lines, &mut current_spans);
                     current_spans.push(Span::styled(
@@ -557,10 +556,17 @@ fn highlight_code_line(
     highlighter: &mut HighlightLines<'static>,
 ) -> Vec<Span<'static>> {
     let assets = code_highlight_assets();
-    match highlighter.highlight_line(line, &assets.syntax_set) {
+    let line_with_nl = format!("{line}\n");
+    match highlighter.highlight_line(&line_with_nl, &assets.syntax_set) {
         Ok(highlighted) => highlighted
             .into_iter()
-            .map(|(style, text)| Span::styled(text.to_string(), syntect_style_to_ratatui(style)))
+            .map(|(style, text)| {
+                Span::styled(
+                    text.trim_end_matches('\n').to_string(),
+                    syntect_style_to_ratatui(style),
+                )
+            })
+            .filter(|span| !span.content.is_empty())
             .collect(),
         Err(_) => Vec::new(),
     }
@@ -745,6 +751,83 @@ mod tests {
                 .iter()
                 .any(|span| matches!(span.style.fg, Some(Color::Rgb(_, _, _)))),
             "expected at least one syntax-colored span"
+        );
+    }
+
+    #[test]
+    fn python_comment_does_not_affect_next_lines() {
+        let input = "```python\n# this is a comment\nprint('hello')\n```";
+        let doc = render_markdown(input).expect("render succeeds");
+
+        let code_lines: Vec<&Line> = doc
+            .lines
+            .iter()
+            .filter(|line| {
+                let combined: String =
+                    line.spans.iter().map(|s| s.content.as_ref()).collect();
+                combined.contains("comment") || combined.contains("print")
+            })
+            .collect();
+
+        assert_eq!(
+            code_lines.len(),
+            2,
+            "expected two code lines with content"
+        );
+
+        // Dump all code-block lines with style annotations for manual inspection
+        eprintln!("=== Python code block render output ===");
+        for (i, line) in doc.lines.iter().enumerate() {
+            let combined: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+            if combined.is_empty() {
+                continue;
+            }
+            eprint!("  line {i}: ");
+            for span in &line.spans {
+                let has_fg = span.style.fg.is_some();
+                let is_dim = span.style.add_modifier.contains(Modifier::DIM);
+                let label = if has_fg {
+                    "C"
+                } else if is_dim {
+                    "D"
+                } else {
+                    " "
+                };
+                eprint!("[{label}]{}", span.content);
+            }
+            eprintln!();
+        }
+        eprintln!("=== end ===");
+
+        let comment_line = code_lines[0];
+        let comment_combined: String = comment_line
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(
+            comment_combined.contains("# this is a comment"),
+            "comment line should contain the comment text"
+        );
+
+        let code_line = code_lines[1];
+        let code_combined: String = code_line
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(
+            code_combined.contains("print('hello')"),
+            "code line should contain print"
+        );
+
+        let code_has_color = code_line
+            .spans
+            .iter()
+            .any(|span| matches!(span.style.fg, Some(Color::Rgb(_, _, _))));
+        assert!(
+            code_has_color,
+            "line after comment should have syntax-colored spans, not dim fallback"
         );
     }
 
