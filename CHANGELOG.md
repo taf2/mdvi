@@ -11,7 +11,6 @@ All notable changes to this project will be documented in this file.
 - Text-mode image renderer (`--image-protocol symbols`, default when no graphics protocol is
   available): per-cell best fit over sextant, quadrant and eighth-block glyphs, with SVG text
   drawn as real terminal characters.
-- Status bar hint with the `gsettings` command to enable SIXEL in GNOME Terminal.
 
 ### Fixed
 - Images were downscaled with nearest-neighbour sampling; they are now pre-fitted with Lanczos.

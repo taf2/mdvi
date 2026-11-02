@@ -35,8 +35,6 @@ Notes:
 - HTML `<img>` `width` and `height` hints are used to reserve image space before lazy loading finishes.
 - On macOS, terminal-native image protocols can trigger an "Allow Terminal-Initiated Display?" prompt.
   Use `--image-protocol symbols` if you want image rendering without that dialog.
-- GNOME Terminal ships with SIXEL disabled; mdvi then uses text-mode images and shows the
-  `gsettings` command that enables full-resolution images in the status bar.
 - Fenced code blocks with language tags (for example, a block tagged `rust`) render with syntax highlighting.
 - Code blocks preserve blank lines and expand tabs to four-column stops.
 - Resizing the terminal keeps the cursor anchored to its text. An active rectangular

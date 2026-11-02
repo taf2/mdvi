@@ -1619,11 +1619,6 @@ pub fn run(file_path: PathBuf, start_line: usize, image_protocol: ImageProtocol)
             ImageProtocol::Halfblocks => CellArtMode::HalfBlocks,
             _ => CellArtMode::Mosaic,
         });
-        if matches!(image_protocol, ImageProtocol::Auto) && !app.images.is_empty() {
-            if let Some(hint) = graphics_upgrade_hint() {
-                app.status = hint;
-            }
-        }
     }
     let mut should_redraw = true;
     let mut last_content_width = None;
@@ -2014,36 +2009,6 @@ fn parse_window_pixel_report(response: &[u8]) -> Option<(u16, u16)> {
 
 fn app_uses_text_images(picker: &Picker) -> bool {
     picker.protocol_type() == ProtocolType::Halfblocks
-}
-
-/// Terminals that can show real pixels but have it switched off get a one-line hint.
-/// GNOME Terminal (VTE) ships with SIXEL disabled per profile.
-fn graphics_upgrade_hint() -> Option<String> {
-    std::env::var_os("VTE_VERSION")?;
-    if std::env::var_os("GNOME_TERMINAL_SCREEN").is_none()
-        && std::env::var_os("GNOME_TERMINAL_SERVICE").is_none()
-    {
-        return Some(
-            "images in text mode; enable SIXEL in your terminal for full resolution".to_string(),
-        );
-    }
-    let output = std::process::Command::new("gsettings")
-        .args(["get", "org.gnome.Terminal.ProfilesList", "default"])
-        .stderr(std::process::Stdio::null())
-        .output()
-        .ok()?;
-    let profile = String::from_utf8_lossy(&output.stdout)
-        .trim()
-        .trim_matches('\'')
-        .to_string();
-    if profile.is_empty() || !profile.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
-        return Some(
-            "images in text mode; enable SIXEL in GNOME Terminal for full resolution".to_string(),
-        );
-    }
-    Some(format!(
-        "images in text mode; for full resolution run: gsettings set org.gnome.Terminal.Legacy.Profile:/org/gnome/terminal/legacy/profiles:/:{profile}/ enable-sixel true  (then reopen mdvi)"
-    ))
 }
 
 fn protocol_override(image_protocol: ImageProtocol) -> Option<ProtocolType> {
