@@ -7,12 +7,16 @@ All notable changes to this project will be documented in this file.
 ## [0.6.9] - 2026-11-02
 
 ### Added
+- Configurable content width with `--width 72` or `--width 80` (issue #2).
+- Simplified Chinese and Japanese README translations.
 - SVG image support (local and remote), rasterized with `resvg`.
 - Text-mode image renderer (`--image-protocol symbols`, default when no graphics protocol is
   available): per-cell best fit over sextant, quadrant and eighth-block glyphs, with SVG text
   drawn as real terminal characters.
 
 ### Fixed
+- Code blocks preserve authored line breaks and scroll horizontally instead of wrapping (issue #2).
+- Removed the unsupported GNOME Terminal SIXEL configuration hint.
 - Images were downscaled with nearest-neighbour sampling; they are now pre-fitted with Lanczos.
 - Images were capped at 18 rows; the cap now scales with the viewport height.
 - Partially scrolled images no longer jump to an unscaled crop.

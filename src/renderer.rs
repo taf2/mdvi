@@ -18,6 +18,7 @@ pub struct RenderedDoc {
     pub lines: Vec<Line<'static>>,
     pub images: Vec<RenderedImage>,
     pub tables: Vec<std::ops::Range<usize>>,
+    pub code_blocks: Vec<std::ops::Range<usize>>,
 }
 
 #[derive(Debug, Clone)]
@@ -155,6 +156,8 @@ pub fn render_markdown(input: &str) -> Result<RenderedDoc> {
     let mut list_stack: Vec<ListKind> = Vec::new();
     let mut in_code_block = false;
     let mut code_text = String::new();
+    let mut code_blocks = Vec::new();
+    let mut code_block_start = 0;
     let mut active_code_highlighter: Option<HighlightLines<'static>> = None;
     let mut blockquote_starts = Vec::new();
     let mut pending_link: Option<(String, usize)> = None;
@@ -275,6 +278,7 @@ pub fn render_markdown(input: &str) -> Result<RenderedDoc> {
                 Tag::CodeBlock(kind) => {
                     blank_line(&mut lines, &mut current_spans);
                     in_code_block = true;
+                    code_block_start = lines.len();
                     let code_block_info = match kind {
                         CodeBlockKind::Fenced(lang) => {
                             let lang = lang.trim();
@@ -401,6 +405,7 @@ pub fn render_markdown(input: &str) -> Result<RenderedDoc> {
                         Style::default().add_modifier(Modifier::DIM),
                     )));
                     lines.push(Line::default());
+                    code_blocks.push(code_block_start..lines.len() - 1);
                     in_code_block = false;
                     active_code_highlighter = None;
                 }
@@ -579,6 +584,7 @@ pub fn render_markdown(input: &str) -> Result<RenderedDoc> {
         lines,
         images,
         tables,
+        code_blocks,
     })
 }
 
@@ -846,6 +852,19 @@ mod tests {
             .iter()
             .any(|span| span.content == "italics"
                 && span.style.add_modifier.contains(Modifier::ITALIC)));
+    }
+
+    #[test]
+    fn code_block_ranges_include_fences_and_indented_blocks_only() {
+        let doc =
+            render_markdown("before\n\n```text\nwide code\n```\n\nafter\n\n    indented code\n")
+                .unwrap();
+        assert_eq!(doc.code_blocks.len(), 2);
+        for block in &doc.code_blocks {
+            assert!(doc.lines[block.start].to_string().starts_with("```"));
+            assert_eq!(doc.lines[block.end - 1].to_string(), "```");
+            assert_eq!(block.len(), 3);
+        }
     }
 
     #[test]

@@ -14,6 +14,7 @@
 - 显示可见光标，并在状态栏中以 `line:column` 格式显示光标位置
 - 通过 `pulldown-cmark` 提供高质量 Markdown 渲染
 - 自动换行，同时保持滚动、搜索、选择和内联图片的位置一致
+- 通过 `--width` 设置内容宽度（例如终端的 72 列或 80 列）
 - 支持 Unicode 的布局和光标移动，包括宽字符和 emoji
 - 支持：
   - 标题
@@ -35,9 +36,9 @@
 - HTML `<img>` 的 `width` 和 `height` 提示会在延迟加载完成前用于预留图片空间。
 - 在 macOS 上，终端原生图片协议可能触发“Allow Terminal-Initiated Display?”提示。
   如果希望在不显示该对话框的情况下渲染图片，请使用 `--image-protocol symbols`。
-- GNOME Terminal 默认禁用 SIXEL；此时 mdvi 会使用文本模式图片，并在状态栏中显示用于启用全分辨率图片的 `gsettings` 命令。
 - 带语言标签的围栏代码块（例如标记为 `rust` 的代码块）会使用语法高亮渲染。
-- 代码块保留空行，并将制表符展开到每四列一个的制表位。
+- 代码块保留原有换行和空行，并将制表符展开到每四列一个的制表位。
+  宽代码块与表格一样，可使用 `h` / `l` 或方向键横向滚动。
 - 调整终端大小时，光标会保持在原来的文本位置。宽度变化时，当前矩形选区会被清除，因为其屏幕坐标发生了变化。
 
 运行 `make run ARGS='examples/rendering.md'` 可查看渲染示例。
@@ -88,9 +89,13 @@ mdvi [OPTIONS] <PATH>
 
 ```bash
 mdvi docs/spec.md
+mdvi --width 80 docs/spec.md
 mdvi --line 120 CHANGELOG.md
 mdvi --image-protocol symbols README.md
 ```
+
+`--width` 设置内容的最大宽度，不包括边框。终端较窄时会自动缩小宽度；
+省略此选项则使用终端的可用宽度。代码块和表格保留原有行，不自动换行。
 
 ## 导航
 

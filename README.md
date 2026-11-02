@@ -14,6 +14,7 @@ It renders markdown into a polished full-screen TUI with fast keyboard navigatio
 - Visible cursor and `line:column` cursor position in the status bar
 - High-quality markdown rendering via `pulldown-cmark`
 - Word wrapping that keeps scrolling, search, selection, and inline images aligned
+- Configurable content width with `--width` (for example, 72 or 80 terminal columns)
 - Unicode-aware layout and cursor movement, including wide characters and emoji
 - Support for:
   - headings
@@ -37,7 +38,8 @@ Notes:
 - On macOS, terminal-native image protocols can trigger an "Allow Terminal-Initiated Display?" prompt.
   Use `--image-protocol symbols` if you want image rendering without that dialog.
 - Fenced code blocks with language tags (for example, a block tagged `rust`) render with syntax highlighting.
-- Code blocks preserve blank lines and expand tabs to four-column stops.
+- Code blocks preserve authored line breaks and blank lines, and expand tabs to four-column stops.
+  Wide code blocks scroll horizontally with `h` / `l` or the arrow keys, like tables.
 - Resizing the terminal keeps the cursor anchored to its text. An active rectangular
   selection clears when the width changes because its screen coordinates change.
 
@@ -90,9 +92,14 @@ Examples:
 
 ```bash
 mdvi docs/spec.md
+mdvi --width 80 docs/spec.md
 mdvi --line 120 CHANGELOG.md
 mdvi --image-protocol symbols README.md
 ```
+
+`--width` sets the maximum content width, excluding the border. It shrinks to fit
+narrower terminals; omitting it uses the available terminal width. Code blocks and
+tables keep their original rows instead of wrapping.
 
 ## Navigation
 

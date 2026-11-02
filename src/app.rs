@@ -48,6 +48,7 @@ const MAX_CACHED_IMAGE_VARIANTS: usize = 24;
 struct App {
     file_path: PathBuf,
     file_content: String,
+    max_width: Option<u16>,
     doc: RenderedDoc,
     picker: Picker,
     images: Vec<InlineImage>,
@@ -245,6 +246,7 @@ impl App {
         let mut app = Self {
             file_path,
             file_content,
+            max_width: None,
             doc,
             picker,
             images,
@@ -851,7 +853,7 @@ impl App {
 
         let target_row = self.virtual_row_for_search_match(self.search_matches[0], content_width);
         self.cursor_row = target_row;
-        self.reveal_table_match(content_width);
+        self.reveal_unwrapped_match(content_width);
         let max_scroll = self.max_scroll(viewport_height, content_width);
         self.scroll = target_row.min(max_scroll);
         self.status = format!("{} matches for /{query}", self.search_matches.len());
@@ -868,7 +870,7 @@ impl App {
         let target_row = self
             .virtual_row_for_search_match(self.search_matches[self.active_match], content_width);
         self.cursor_row = target_row;
-        self.reveal_table_match(content_width);
+        self.reveal_unwrapped_match(content_width);
         let max_scroll = self.max_scroll(viewport_height, content_width);
         self.scroll = target_row.min(max_scroll);
     }
@@ -888,16 +890,16 @@ impl App {
         let target_row = self
             .virtual_row_for_search_match(self.search_matches[self.active_match], content_width);
         self.cursor_row = target_row;
-        self.reveal_table_match(content_width);
+        self.reveal_unwrapped_match(content_width);
         let max_scroll = self.max_scroll(viewport_height, content_width);
         self.scroll = target_row.min(max_scroll);
     }
 
-    fn reveal_table_match(&mut self, width: u16) {
+    fn reveal_unwrapped_match(&mut self, width: u16) {
         let Some(index) = self.active_match_line() else {
             return;
         };
-        if self.doc.tables.iter().any(|table| table.contains(&index)) {
+        if self.unwrapped_block(index).is_some() {
             let text = self.line_text_at(index);
             if let Some(found) = self
                 .search_regex
@@ -956,21 +958,34 @@ impl App {
         }
     }
 
+    fn content_width(&self, available: u16) -> u16 {
+        self.max_width
+            .map_or(available, |width| width.min(available))
+    }
+
+    fn unwrapped_block(&self, index: usize) -> Option<&std::ops::Range<usize>> {
+        self.doc
+            .tables
+            .iter()
+            .chain(&self.doc.code_blocks)
+            .find(|block| block.contains(&index))
+    }
+
     fn line_ranges(&self, index: usize, text: &str, width: u16) -> Vec<std::ops::Range<usize>> {
-        if self.doc.tables.iter().any(|table| table.contains(&index)) {
+        if self.unwrapped_block(index).is_some() {
             std::iter::once(0..text.len()).collect()
         } else {
             wrapped_ranges(text, width)
         }
     }
 
-    // Clip only the active table, keeping all its rows at the same horizontal offset.
+    // Clip only the active table or code block, keeping its rows at the same offset.
     // Navigation and selection continue to use the complete, unwrapped rows.
-    fn pan_table(&self, display: &mut DisplayDoc, width: u16, column: usize) -> usize {
+    fn pan_unwrapped_block(&self, display: &mut DisplayDoc, width: u16, column: usize) -> usize {
         let Some(index) = display.doc_line_for_row.get(self.cursor_row) else {
             return 0;
         };
-        let Some(table) = self.doc.tables.iter().find(|table| table.contains(index)) else {
+        let Some(table) = self.unwrapped_block(*index) else {
             return 0;
         };
         let offset = column.saturating_sub(usize::from(width.saturating_sub(1)));
@@ -1522,12 +1537,7 @@ impl App {
         let mut doc_line_for_row: Vec<usize> = Vec::with_capacity(source_lines.len());
 
         for (line_index, line) in source_lines.into_iter().enumerate() {
-            let wrapped = if self
-                .doc
-                .tables
-                .iter()
-                .any(|table| table.contains(&line_index))
-            {
+            let wrapped = if self.unwrapped_block(line_index).is_some() {
                 vec![line]
             } else {
                 wrap_line(&line, content_width)
@@ -1595,7 +1605,12 @@ impl Drop for TuiGuard {
     }
 }
 
-pub fn run(file_path: PathBuf, start_line: usize, image_protocol: ImageProtocol) -> Result<()> {
+pub fn run(
+    file_path: PathBuf,
+    start_line: usize,
+    image_protocol: ImageProtocol,
+    max_width: Option<u16>,
+) -> Result<()> {
     let mut tui = TuiGuard::setup()?;
     let picker = if let Some(protocol_type) = protocol_override(image_protocol) {
         // Explicit choices must not launch a stdin capability probe: a terminal
@@ -1614,6 +1629,7 @@ pub fn run(file_path: PathBuf, start_line: usize, image_protocol: ImageProtocol)
     };
     let uses_text_images = app_uses_text_images(&picker);
     let mut app = App::new(file_path, start_line, picker)?;
+    app.max_width = max_width;
     if uses_text_images {
         app.text_image_mode = Some(match image_protocol {
             ImageProtocol::Halfblocks => CellArtMode::HalfBlocks,
@@ -1643,7 +1659,8 @@ pub fn run(file_path: PathBuf, start_line: usize, image_protocol: ImageProtocol)
 
                 let title = format!(" mdvi {} ", app.file_path.display());
                 let content_block = Block::default().borders(Borders::ALL).title(title);
-                let content_inner = content_block.inner(chunks[0]);
+                let mut content_inner = content_block.inner(chunks[0]);
+                content_inner.width = app.content_width(content_inner.width);
                 let content_width = content_inner.width;
                 let viewport_height = usize::from(content_inner.height);
                 app.set_viewport_height(viewport_height);
@@ -1677,7 +1694,7 @@ pub fn run(file_path: PathBuf, start_line: usize, image_protocol: ImageProtocol)
                     .map(|line| App::clamp_column(&line_plain_text(line), app.cursor_column)).unwrap_or(0);
 
                 app.apply_visual_selection_to_display_doc(&mut display_doc, content_width);
-                let horizontal_offset = app.pan_table(&mut display_doc, content_width, cursor_column);
+                let horizontal_offset = app.pan_unwrapped_block(&mut display_doc, content_width, cursor_column);
                 // Layout already produced physical rows. Slice with usize so long
                 // documents do not wrap the scroll offset at 65,536 lines.
                 let text = viewport_text(std::mem::take(&mut display_doc.lines), app.scroll, viewport_height);
@@ -1887,7 +1904,7 @@ pub fn run(file_path: PathBuf, start_line: usize, image_protocol: ImageProtocol)
 
                 let size = tui.terminal_mut().size()?;
                 let viewport_height = size.height.saturating_sub(3) as usize;
-                let content_width = size.width.saturating_sub(2);
+                let content_width = app.content_width(size.width.saturating_sub(2));
                 let half_page = (viewport_height / 2).max(1);
                 let full_page = viewport_height.max(1);
 
@@ -2679,10 +2696,12 @@ mod tests {
         App {
             file_path: PathBuf::from("test.md"),
             file_content: String::new(),
+            max_width: None,
             doc: RenderedDoc {
                 lines: doc_lines,
                 images: Vec::new(),
                 tables: Vec::new(),
+                code_blocks: Vec::new(),
             },
             picker: Picker::from_fontsize((8, 16)),
             images: Vec::new(),
@@ -2710,6 +2729,63 @@ mod tests {
     }
 
     #[test]
+    fn configured_width_wraps_prose_and_tracks_search_on_resize() {
+        let mut app = test_app(0);
+        app.doc = render_markdown("alpha beta gamma delta epsilon").unwrap();
+        assert_eq!(app.content_width(100), 100);
+        app.max_width = Some(12);
+        let width = app.content_width(100);
+        assert_eq!(width, 12);
+        let display = app.build_display_doc(width);
+        assert!(display.lines.iter().all(|line| line.width() <= 12));
+        assert!(display.lines.len() > 1);
+        app.search("epsilon", 10, width);
+        assert!(app.build_display_doc(width).lines[app.cursor_row]
+            .to_string()
+            .contains("epsilon"));
+        let narrow = app.content_width(8);
+        assert_eq!(narrow, 8);
+        app.reflow_cursor(width, narrow);
+        assert!(app.build_display_doc(narrow).lines[app.cursor_row]
+            .to_string()
+            .contains("epsilon"));
+        assert_eq!(app.content_width(0), 0);
+    }
+
+    #[test]
+    fn code_blocks_preserve_lines_and_pan_to_search_matches() {
+        let mut app = test_app(0);
+        app.doc = render_markdown("```python\nprint('a very long string with a needle')\n\n# second line\n```\n\nProse after this block wraps normally.").unwrap();
+        let block = app.doc.code_blocks[0].clone();
+        assert_eq!(block, 0..5);
+        let width = 12;
+        let display = app.build_display_doc(width);
+        assert_eq!(display.lines[1], app.doc.lines[1]);
+        assert_eq!(display.lines[2].to_string(), "");
+        assert_eq!(app.virtual_row_for_doc_line(block.end, width), block.end);
+        assert!(display.lines[block.end..]
+            .iter()
+            .all(|line| line.width() <= usize::from(width)));
+        app.search("needle", 10, width);
+        assert_eq!(app.cursor_row, 1);
+        assert!(app.cursor_column > usize::from(width));
+        let mut display = app.build_display_doc(width);
+        let original = display.lines[1].clone();
+        let offset = app.pan_unwrapped_block(&mut display, width, app.cursor_column);
+        assert!(offset > 0);
+        assert_eq!(
+            display.lines[1],
+            clip_line(&original, offset, usize::from(width))
+        );
+        assert_eq!(display.lines[1].to_string().chars().last(), Some('n'));
+        let column = app.cursor_column;
+        app.reflow_cursor(width, 8);
+        assert_eq!((app.cursor_row, app.cursor_column), (1, column));
+        app.move_cursor_left(8);
+        assert_eq!(app.cursor_column, column - 1);
+    }
+
+    #[test]
     fn wide_tables_keep_rows_aligned_and_pan_with_cursor() {
         use ratatui::{backend::TestBackend, widgets::Paragraph};
         let mut app = test_app(0);
@@ -2727,7 +2803,7 @@ mod tests {
             app.move_cursor_right(width);
         }
         assert_eq!(app.cursor_column, 30);
-        let offset = app.pan_table(&mut display, width, app.cursor_column);
+        let offset = app.pan_unwrapped_block(&mut display, width, app.cursor_column);
         assert_eq!(offset, 11);
         let mut terminal = Terminal::new(TestBackend::new(width, table.len() as u16)).unwrap();
         terminal
@@ -2753,7 +2829,7 @@ mod tests {
         assert_eq!(app.cursor_row, table.start + 3);
         assert!(app.cursor_column > usize::from(width));
         let mut display = app.build_display_doc(width);
-        let offset = app.pan_table(&mut display, width, app.cursor_column);
+        let offset = app.pan_unwrapped_block(&mut display, width, app.cursor_column);
         assert!(offset > 0);
         assert!(line_plain_text(&display.lines[app.cursor_row]).ends_with('r'));
     }
