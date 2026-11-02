@@ -1,53 +1,52 @@
 # mdvi
 <p align="center"><a href="./README.md">English</a> · <a href="./README.zh-CN.md">简体中文</a> · <a href="./README.ja.md">日本語</a></p>
 
-`mdvi` is a terminal markdown viewer with Vim-style navigation.
+**A fast, full-screen markdown viewer for the terminal, with Vim-style navigation.**
 
-It renders markdown into a polished full-screen TUI with fast keyboard navigation, clear typography, and predictable behavior for large files.
+`mdvi` renders markdown with clear typography, syntax-highlighted code, aligned
+tables, and inline images, and stays responsive on large files.
 
-<img width="1595" height="582" alt="Screenshot 2026-02-10 at 4 58 34 PM" src="https://github.com/user-attachments/assets/1b2da7a1-b5fb-4169-9d10-bcd97a07ae45" />
+<img width="1595" height="582" alt="mdvi rendering a markdown document in the terminal" src="https://github.com/user-attachments/assets/1b2da7a1-b5fb-4169-9d10-bcd97a07ae45" />
+
+## Quick start
+
+```bash
+brew tap taf2/tap
+brew install mdvi
+
+mdvi README.md
+```
+
+Press `?` for help and `q` to quit. Other install options are in [Install](#install).
 
 ## Features
 
-- Full-screen terminal viewer (`crossterm` + `ratatui`)
-- Vim-style navigation controls
-- Visible cursor and `line:column` cursor position in the status bar
-- High-quality markdown rendering via `pulldown-cmark`
-- Word wrapping that keeps scrolling, search, selection, and inline images aligned
-- Configurable content width with `--width` (for example, 72 or 80 terminal columns)
-- Unicode-aware layout and cursor movement, including wide characters and emoji
-- Support for:
-  - headings
-  - lists and task lists
-  - blockquotes
-  - inline markdown images (`![alt](...)`) and HTML `<img ...>` tags
-  - lazy image loading with immediate placeholder layout reservation
-  - syntax-highlighted fenced code blocks and inline code
-  - links, aligned tables with distinct headers, footnotes, emphasis/strong/strikethrough
-- Configurable image backend via `--image-protocol` (`auto`, `symbols`, `halfblocks`, `sixel`, `kitty`, `iterm2`)
-- SVG images, rasterized with `resvg`
-- High-detail text-mode images when the terminal has no graphics protocol: each cell picks the best
-  of sextant, quadrant and eighth-block glyphs, and SVG text is drawn as real, crisp terminal text
-- Reload from disk on demand (`r`)
-- Start at specific line (`--line`)
-- Works with standard terminal keys (arrows, page up/down, home/end)
+**Rendering**
+- Headings, lists, task lists, blockquotes, footnotes, links, and emphasis/strong/strikethrough
+- Fenced code blocks with syntax highlighting. Authored line breaks are preserved, tabs expand to
+  four-column stops, and wide blocks scroll horizontally instead of wrapping
+- Tables with distinct headers and aligned columns. Wide tables scroll horizontally
+- Word wrapping that keeps scrolling, search, selection, and images aligned
+- Unicode-aware layout, including wide characters and emoji
+- Optional maximum content width (`--width 80`)
 
-Notes:
-- Local, `file://`, and remote `http://` / `https://` image sources are supported.
-- HTML `<img>` `width` and `height` hints are used to reserve image space before lazy loading finishes.
-- On macOS, terminal-native image protocols can trigger an "Allow Terminal-Initiated Display?" prompt.
-  Use `--image-protocol symbols` if you want image rendering without that dialog.
-- Fenced code blocks with language tags (for example, a block tagged `rust`) render with syntax highlighting.
-- Code blocks preserve authored line breaks and blank lines, and expand tabs to four-column stops.
-  Wide code blocks scroll horizontally with `h` / `l` or the arrow keys, like tables.
-- Resizing the terminal keeps the cursor anchored to its text. An active rectangular
-  selection clears when the width changes because its screen coordinates change.
+**Images**
+- Markdown images (`![alt](...)`) and HTML `<img>` tags
+- Local, `file://`, and remote `http(s)://` sources, loaded lazily with space reserved up front
+- SVG support, rasterized with `resvg`
+- Native graphics protocols (Kitty, iTerm2, Sixel) when available
+- High-detail text-mode fallback for other terminals (see [Images](#images))
 
-Try the rendering showcase with `make run ARGS='examples/rendering.md'`.
+**Navigation**
+- Vim-style motions, plus arrows, Page Up/Down, and Home/End
+- Visible cursor with `line:column` in the status bar
+- Case-insensitive search with match highlighting
+- Rectangular selection with copy to the clipboard
+- Reload from disk without restarting (`r`)
 
 ## Install
 
-### Homebrew (tap)
+### Homebrew
 
 ```bash
 brew tap taf2/tap
@@ -56,30 +55,23 @@ brew install mdvi
 
 ### From source
 
-Install a current stable Rust toolchain (including Cargo), a C linker, and Make.
-From the project root, build an optimized binary with:
+Requires a current stable Rust toolchain (with Cargo), a C linker, and Make.
 
 ```bash
-make
-./target/release/mdvi README.md
+git clone https://github.com/taf2/mdvi.git
+cd mdvi
+make            # builds target/release/mdvi
+make install    # installs into Cargo's bin directory (usually ~/.cargo/bin)
 ```
 
-The first build downloads dependencies and takes longer; subsequent builds reuse
-Cargo's cache. To install `mdvi` into Cargo's bin directory (usually `~/.cargo/bin`):
+Make sure Cargo's bin directory is on your `PATH`. Without Make, use
+`cargo build --release --locked` to build or `cargo install --locked --path .` to install.
+
+To try it without installing:
 
 ```bash
-make install
-```
-
-If Make is unavailable, use `cargo build --release --locked` to build or
-`cargo install --locked --path .` to install. Ensure Cargo's bin directory is on
-your `PATH` when using the installed command.
-
-### Run without install
-
-```bash
-make run
-make run ARGS='--image-protocol symbols README.md'
+make run                                  # opens README.md
+make run ARGS='examples/rendering.md'     # rendering showcase
 ```
 
 ## Usage
@@ -87,6 +79,14 @@ make run ARGS='--image-protocol symbols README.md'
 ```bash
 mdvi [OPTIONS] <PATH>
 ```
+
+| Option | Description |
+| --- | --- |
+| `-l`, `--line <N>` | Start at line `N` (1-based). Default: `1` |
+| `--width <COLS>` | Maximum content width in columns, excluding the border. Shrinks to fit narrower terminals. Default: full terminal width |
+| `--image-protocol <P>` | Image backend: `auto` (default), `symbols`, `halfblocks`, `sixel`, `kitty`, `iterm2` |
+| `-h`, `--help` | Show help |
+| `-V`, `--version` | Show version |
 
 Examples:
 
@@ -97,67 +97,78 @@ mdvi --line 120 CHANGELOG.md
 mdvi --image-protocol symbols README.md
 ```
 
-`--width` sets the maximum content width, excluding the border. It shrinks to fit
-narrower terminals; omitting it uses the available terminal width. Code blocks and
-tables keep their original rows instead of wrapping.
+## Key bindings
 
-## Navigation
+### Movement
 
-- `j` / `Down`: scroll down one line
-- `k` / `Up`: scroll up one line
-- `h` / `Left`, `l` / `Right`: move the cursor horizontally
-- Wide tables keep their columns aligned; move right/left with `l`/`h` or the arrow keys to scroll across them.
-- `w` / `b`: move to the next / previous word
-- `W` / `B`: move to the next / previous whitespace-delimited word
-- `d`: half-page down (less-style)
-- `u`: half-page up (less-style)
-- `Ctrl-d`: half-page down
-- `Ctrl-u`: half-page up
-- `PageDown`: full-page down
-- `PageUp`: full-page up
-- `Ctrl-f`: full-page down (Vim-style)
-- `Ctrl-b`: full-page up (Vim-style)
-- `g` / `Home`: jump to top
-- `G` / `End`: jump to bottom
-- `r`: reload file from disk
-- `/`: start search
-- `n`: next search match
-- `N`: previous search match
-- `Enter`: submit search; `Esc`: cancel search input
-- `Ctrl-v`: toggle rectangular selection; `y`: copy selection to the clipboard
-- `Esc`: clear rectangular selection
-- `?`: toggle help line
-- `q`: quit
-- `Ctrl-c`: quit from any mode
+| Key | Action |
+| --- | --- |
+| `j` / `Down` | Down one line |
+| `k` / `Up` | Up one line |
+| `h` / `Left`, `l` / `Right` | Move cursor left / right; scrolls wide tables and code blocks |
+| `w` / `b` | Next / previous word |
+| `W` / `B` | Next / previous whitespace-delimited word |
+| `d` / `Ctrl-d` | Half page down |
+| `u` / `Ctrl-u` | Half page up |
+| `Ctrl-f` / `PageDown` | Full page down |
+| `Ctrl-b` / `PageUp` | Full page up |
+| `g` / `Home` | Jump to top |
+| `G` / `End` | Jump to bottom |
+
+### Search
+
+| Key | Action |
+| --- | --- |
+| `/` | Start a search |
+| `Enter` / `Esc` | Submit / cancel search input |
+| `n` / `N` | Next / previous match |
 
 Search is literal and case-insensitive. Submit an empty search to clear highlights.
-Clipboard copying requires a clipboard service supported by your environment.
 
-## Why Rust?
+### Selection and other
 
-Rust is a strong fit for a serious CLI viewer:
+| Key | Action |
+| --- | --- |
+| `Ctrl-v` | Toggle rectangular selection |
+| `y` | Copy the selection to the clipboard |
+| `Esc` | Clear the selection |
+| `r` | Reload the file from disk |
+| `?` | Toggle the help line |
+| `q` | Quit |
+| `Ctrl-c` | Quit from any mode |
 
-- precise terminal control
-- excellent performance for large files
-- single executable distribution
-- mature ecosystem for TUI and markdown parsing
+Copying requires a clipboard service supported by your environment. Resizing the
+terminal keeps the cursor anchored to its text; an active selection is cleared when
+the width changes, because its screen coordinates no longer match.
+
+## Images
+
+With `--image-protocol auto` (the default), `mdvi` uses your terminal's native
+graphics protocol when it detects one. Otherwise it draws images as text: each cell
+picks the best of sextant, quadrant, and eighth-block glyphs, and text inside SVGs is
+rendered as real terminal text so it stays sharp.
+
+- HTML `<img>` `width` and `height` attributes are used to reserve space before an image finishes loading.
+- On macOS, native image protocols can trigger an "Allow Terminal-Initiated Display?"
+  prompt. Use `--image-protocol symbols` to render images without it.
 
 ## Development
 
 ```bash
 make help     # list all commands
-make check    # formatting check, tests, and Clippy (warnings are errors)
+make check    # format check, tests, and Clippy (warnings are errors)
 make fmt      # format Rust source
 make test     # run tests only
 make debug    # faster development build in target/debug/mdvi
 make clean    # remove build artifacts
 ```
 
-Builds and tests use the committed `Cargo.lock` with `--locked` for reproducibility.
-CI runs checks and release builds on Linux and macOS. You can override Cargo with
-`make CARGO=/path/to/cargo`; standard Cargo environment variables such as
-`CARGO_TARGET_DIR` and `CARGO_BUILD_JOBS` are also respected.
+Builds and tests use the committed `Cargo.lock` with `--locked`. CI runs checks and
+release builds on Linux and macOS. Override Cargo with `make CARGO=/path/to/cargo`;
+standard Cargo variables such as `CARGO_TARGET_DIR` and `CARGO_BUILD_JOBS` are respected.
+
+Changes are tracked in [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 
-MIT
+[MIT](LICENSE)
