@@ -19,8 +19,8 @@ use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
-    text::{Line, Span, Text},
-    widgets::{Block, Borders, Clear, Paragraph, Wrap},
+    text::{Line, Span},
+    widgets::{Block, Borders, Clear, Paragraph},
     Terminal,
 };
 use ratatui_image::{
@@ -29,9 +29,11 @@ use ratatui_image::{
     CropOptions, Resize, ResizeEncodeRender,
 };
 use regex::{Regex, RegexBuilder};
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 use crate::{
+    layout::{viewport_text, wrap_line, wrapped_ranges},
     renderer::{read_markdown_file, render_markdown, RenderedDoc},
     ImageProtocol,
 };
@@ -384,36 +386,25 @@ impl App {
         self.ensure_cursor_visible(viewport_height, content_width);
     }
 
-    fn cursor_doc_line_for_navigation(&mut self, content_width: u16) -> usize {
-        self.clamp_cursor_row(content_width);
-        self.build_display_doc(content_width)
-            .doc_line_for_row
-            .get(self.cursor_row)
-            .copied()
-            .unwrap_or_else(|| self.doc.lines.len().saturating_sub(1))
-    }
-
     fn image_virtual_bounds(&self, content_width: u16) -> Vec<ImageVirtualBounds> {
         let mut bounds = Vec::new();
-        let mut accumulated_image_rows = 0usize;
-
-        for (image_index, image) in self.images.iter().enumerate() {
-            let height = self.image_height_for(image, content_width);
-            if height == 0 {
-                continue;
+        if self.images.is_empty() {
+            return bounds;
+        }
+        let mut row = 0;
+        for (line_index, line) in self.doc.lines.iter().enumerate() {
+            row += wrapped_ranges(&line_plain_text(line), content_width).len();
+            if let Some(&image_index) = self.image_index_by_line.get(&line_index) {
+                let height = self.image_height_for(&self.images[image_index], content_width);
+                if height > 0 {
+                    bounds.push(ImageVirtualBounds {
+                        image_index,
+                        start_row: row,
+                        end_row: row + height,
+                    });
+                    row += height;
+                }
             }
-
-            let start_row = image
-                .line_index
-                .saturating_add(1)
-                .saturating_add(accumulated_image_rows);
-            let end_row = start_row.saturating_add(height);
-            bounds.push(ImageVirtualBounds {
-                image_index,
-                start_row,
-                end_row,
-            });
-            accumulated_image_rows = accumulated_image_rows.saturating_add(height);
         }
 
         bounds
@@ -503,24 +494,29 @@ impl App {
             .unwrap_or_default()
     }
 
-    fn visible_line_width_at(&self, index: usize) -> usize {
-        self.line_text_at(index).trim_end().width()
+    fn cursor_row_text(&mut self, content_width: u16) -> String {
+        self.build_display_doc(content_width)
+            .lines
+            .get(self.cursor_row)
+            .map(line_plain_text)
+            .unwrap_or_default()
     }
 
-    fn max_cursor_column_for_line(&self, index: usize) -> usize {
-        self.visible_line_width_at(index).saturating_sub(1)
+    fn effective_cursor_column(&mut self, content_width: u16) -> usize {
+        let text = self.cursor_row_text(content_width);
+        Self::clamp_column(&text, self.cursor_column)
     }
 
-    fn effective_cursor_column_for_line(&self, index: usize) -> usize {
-        self.cursor_column
-            .min(self.max_cursor_column_for_line(index))
+    fn clamp_column(text: &str, desired: usize) -> usize {
+        let column = desired.min(text.trim_end().width().saturating_sub(1));
+        Self::column_for_byte_index(text, Self::byte_index_for_column(text, column))
     }
 
     fn current_cursor_position(&mut self, content_width: u16) -> CursorPosition {
-        let line_index = self.cursor_doc_line_for_navigation(content_width);
+        self.clamp_cursor_row(content_width);
         CursorPosition {
             row: self.cursor_row,
-            column: self.effective_cursor_column_for_line(line_index),
+            column: self.effective_cursor_column(content_width),
         }
     }
 
@@ -570,7 +566,7 @@ impl App {
             }
 
             let start_byte = Self::byte_index_for_column(visible_text, col_start);
-            let end_byte = Self::byte_index_for_column(visible_text, col_end.min(visible_width));
+            let end_byte = Self::byte_index_after_column(visible_text, col_end.min(visible_width));
             if end_byte <= start_byte {
                 continue;
             }
@@ -579,23 +575,29 @@ impl App {
         }
     }
 
-    fn move_cursor_left(&mut self) {
-        self.cursor_column = self.cursor_column.saturating_sub(1);
+    fn move_cursor_left(&mut self, content_width: u16) {
+        let text = self.cursor_row_text(content_width);
+        let column = Self::clamp_column(&text, self.cursor_column).saturating_sub(1);
+        self.cursor_column = Self::clamp_column(&text, column);
     }
 
-    fn move_cursor_right(&mut self, line_index: usize) {
-        let max_column = self.max_cursor_column_for_line(line_index);
-        self.cursor_column = self.cursor_column.saturating_add(1).min(max_column);
+    fn move_cursor_right(&mut self, content_width: u16) {
+        let text = self.cursor_row_text(content_width);
+        let column = Self::clamp_column(&text, self.cursor_column);
+        let index = Self::byte_index_for_column(&text, column);
+        let advance = text[index..]
+            .graphemes(true)
+            .next()
+            .map(UnicodeWidthStr::width)
+            .unwrap_or(1);
+        self.cursor_column = Self::clamp_column(&text, column.saturating_add(advance));
     }
 
     fn byte_index_for_column(text: &str, target_column: usize) -> usize {
-        let mut column = 0usize;
-        for (idx, ch) in text.char_indices() {
-            let width = ch.width().unwrap_or(0).max(1);
-            if column >= target_column {
-                return idx;
-            }
-            if column + width > target_column {
+        let mut column = 0;
+        for (idx, grapheme) in text.grapheme_indices(true) {
+            let width = grapheme.width();
+            if column >= target_column || column + width > target_column {
                 return idx;
             }
             column += width;
@@ -603,15 +605,25 @@ impl App {
         text.len()
     }
 
-    fn column_for_byte_index(text: &str, target_index: usize) -> usize {
-        let mut column = 0usize;
-        for (idx, ch) in text.char_indices() {
-            if idx >= target_index {
-                break;
-            }
-            column += ch.width().unwrap_or(0).max(1);
+    fn byte_index_after_column(text: &str, column: usize) -> usize {
+        let index = Self::byte_index_for_column(text, column);
+        if Self::column_for_byte_index(text, index) < column {
+            index
+                + text[index..]
+                    .graphemes(true)
+                    .next()
+                    .map(str::len)
+                    .unwrap_or(0)
+        } else {
+            index
         }
-        column
+    }
+
+    fn column_for_byte_index(text: &str, target_index: usize) -> usize {
+        text.grapheme_indices(true)
+            .take_while(|(idx, _)| *idx < target_index)
+            .map(|(_, grapheme)| grapheme.width())
+            .sum()
     }
 
     fn classify_motion_char(ch: char, kind: WordMotionKind) -> u8 {
@@ -683,19 +695,19 @@ impl App {
     }
 
     fn move_to_next_word(&mut self, content_width: u16, kind: WordMotionKind) {
-        let start_line = self.cursor_doc_line_for_navigation(content_width);
-        let start_column = self.effective_cursor_column_for_line(start_line);
-
-        for line_index in start_line..self.doc.lines.len() {
-            let text = self.line_text_at(line_index);
-            let column = if line_index == start_line {
-                start_column
+        let display = self.build_display_doc(content_width);
+        for row in self.cursor_row..display.lines.len() {
+            let text = line_plain_text(&display.lines[row]);
+            let next = if row == self.cursor_row {
+                Self::find_next_word_start(&text, self.cursor_column, kind)
             } else {
-                0
+                text.char_indices()
+                    .find(|(_, ch)| !ch.is_whitespace())
+                    .map(|(idx, _)| Self::column_for_byte_index(&text, idx))
             };
-            if let Some(next_column) = Self::find_next_word_start(&text, column, kind) {
-                self.cursor_column = next_column;
-                self.cursor_row = self.virtual_row_for_doc_line(line_index, content_width);
+            if let Some(column) = next {
+                self.cursor_column = column;
+                self.cursor_row = row;
                 self.focused_image = None;
                 return;
             }
@@ -703,19 +715,20 @@ impl App {
     }
 
     fn move_to_prev_word(&mut self, content_width: u16, kind: WordMotionKind) {
-        let start_line = self.cursor_doc_line_for_navigation(content_width);
-        let start_column = self.effective_cursor_column_for_line(start_line);
-
-        for line_index in (0..=start_line).rev() {
-            let text = self.line_text_at(line_index);
-            let column = if line_index == start_line {
-                start_column
+        let display = self.build_display_doc(content_width);
+        for row in (0..=self.cursor_row.min(display.lines.len().saturating_sub(1))).rev() {
+            let text = line_plain_text(&display.lines[row]);
+            let column = if row == self.cursor_row {
+                self.cursor_column
             } else {
                 text.width()
             };
-            if let Some(prev_column) = Self::find_prev_word_start(&text, column, kind) {
-                self.cursor_column = prev_column;
-                self.cursor_row = self.virtual_row_for_doc_line(line_index, content_width);
+            if column == 0 {
+                continue;
+            }
+            if let Some(column) = Self::find_prev_word_start(&text, column, kind) {
+                self.cursor_column = column;
+                self.cursor_row = row;
                 self.focused_image = None;
                 return;
             }
@@ -753,7 +766,7 @@ impl App {
             }
 
             let start_byte = Self::byte_index_for_column(visible_text, col_start);
-            let end_byte = Self::byte_index_for_column(visible_text, col_end.min(visible_width));
+            let end_byte = Self::byte_index_after_column(visible_text, col_end.min(visible_width));
             lines.push(visible_text[start_byte..end_byte].to_string());
         }
 
@@ -815,7 +828,7 @@ impl App {
             return;
         }
 
-        let target_row = self.virtual_row_for_doc_line(self.search_matches[0], content_width);
+        let target_row = self.virtual_row_for_search_match(self.search_matches[0], content_width);
         self.cursor_row = target_row;
         let max_scroll = self.max_scroll(viewport_height, content_width);
         self.scroll = target_row.min(max_scroll);
@@ -830,8 +843,8 @@ impl App {
         self.active_match = (self.active_match + 1) % self.search_matches.len();
         self.focused_image = None;
         self.invalidate_highlight_cache();
-        let target_row =
-            self.virtual_row_for_doc_line(self.search_matches[self.active_match], content_width);
+        let target_row = self
+            .virtual_row_for_search_match(self.search_matches[self.active_match], content_width);
         self.cursor_row = target_row;
         let max_scroll = self.max_scroll(viewport_height, content_width);
         self.scroll = target_row.min(max_scroll);
@@ -849,8 +862,8 @@ impl App {
         }
         self.focused_image = None;
         self.invalidate_highlight_cache();
-        let target_row =
-            self.virtual_row_for_doc_line(self.search_matches[self.active_match], content_width);
+        let target_row = self
+            .virtual_row_for_search_match(self.search_matches[self.active_match], content_width);
         self.cursor_row = target_row;
         let max_scroll = self.max_scroll(viewport_height, content_width);
         self.scroll = target_row.min(max_scroll);
@@ -903,13 +916,70 @@ impl App {
     }
 
     fn virtual_row_for_doc_line(&self, line_index: usize, content_width: u16) -> usize {
-        let mut row = line_index;
+        let mut row = self
+            .doc
+            .lines
+            .iter()
+            .take(line_index)
+            .map(|line| wrapped_ranges(&line_plain_text(line), content_width).len())
+            .sum::<usize>();
         for image in &self.images {
             if image.line_index < line_index {
                 row += self.image_height_for(image, content_width);
             }
         }
         row
+    }
+
+    fn reflow_cursor(&mut self, old_width: u16, new_width: u16) {
+        let display = self.build_display_doc(old_width);
+        let Some(&line_index) = display.doc_line_for_row.get(self.cursor_row) else {
+            return;
+        };
+        let screen_row = self.cursor_row.saturating_sub(self.scroll);
+        let first_row = self.virtual_row_for_doc_line(line_index, old_width);
+        let text = self.line_text_at(line_index);
+        let ranges = wrapped_ranges(&text, old_width);
+        let range = ranges
+            .get(self.cursor_row.saturating_sub(first_row))
+            .unwrap_or(&ranges[0]);
+        let byte =
+            range.start + Self::byte_index_for_column(&text[range.clone()], self.cursor_column);
+        let new_ranges = wrapped_ranges(&text, new_width);
+        let offset = new_ranges
+            .iter()
+            .position(|r| r.contains(&byte))
+            .unwrap_or(new_ranges.len() - 1);
+        self.cursor_row = self.virtual_row_for_doc_line(line_index, new_width) + offset;
+        self.cursor_column = text[new_ranges[offset].start..byte].width();
+        if let Some(image) = self.focused_image {
+            if let Some(bounds) = self.image_bounds_for(image, new_width) {
+                self.cursor_row = bounds.start_row;
+            }
+        }
+        self.scroll = self.cursor_row.saturating_sub(screen_row);
+        // A rectangle's screen coordinates no longer describe the same text.
+        if matches!(self.mode, Mode::VisualBlock(_)) {
+            self.mode = Mode::Normal;
+        }
+    }
+
+    fn virtual_row_for_search_match(&self, line_index: usize, content_width: u16) -> usize {
+        let first_row = self.virtual_row_for_doc_line(line_index, content_width);
+        let text = self.line_text_at(line_index);
+        let match_start = self
+            .search_regex
+            .as_ref()
+            .and_then(|regex| regex.find(&text))
+            .map(|m| m.start());
+        let offset = match_start
+            .and_then(|start| {
+                wrapped_ranges(&text, content_width)
+                    .iter()
+                    .position(|range| range.contains(&start))
+            })
+            .unwrap_or(0);
+        first_row + offset
     }
 
     fn effective_image_pixel_size(&self, image: &InlineImage) -> Option<(u32, u32)> {
@@ -1118,7 +1188,7 @@ impl App {
         let reference_protocol = image
             .state
             .as_ref()
-            .or_else(|| image.scratch_state.as_ref())
+            .or(image.scratch_state.as_ref())
             .or_else(|| image.cached_variants.values().next())?;
 
         let target_area = reference_protocol.size_for(resize.clone(), area);
@@ -1136,7 +1206,7 @@ impl App {
         let Some(reference_protocol) = image
             .state
             .as_ref()
-            .or_else(|| image.scratch_state.as_ref())
+            .or(image.scratch_state.as_ref())
             .or_else(|| image.cached_variants.values().next())
         else {
             return;
@@ -1296,8 +1366,9 @@ impl App {
         let mut doc_line_for_row: Vec<usize> = Vec::with_capacity(source_lines.len());
 
         for (line_index, line) in source_lines.into_iter().enumerate() {
-            lines.push(line);
-            doc_line_for_row.push(line_index);
+            let wrapped = wrap_line(&line, content_width);
+            doc_line_for_row.extend(std::iter::repeat_n(line_index, wrapped.len()));
+            lines.extend(wrapped);
 
             if let Some(image_index) = self.image_index_by_line.get(&line_index).copied() {
                 let height = self.image_height_for(&self.images[image_index], content_width);
@@ -1331,13 +1402,19 @@ struct TuiGuard {
 impl TuiGuard {
     fn setup() -> Result<Self> {
         enable_raw_mode().context("failed to enable raw mode")?;
-        let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen).context("failed to enter alternate screen")?;
-
-        let backend = CrosstermBackend::new(stdout);
-        let terminal = Terminal::new(backend).context("failed to initialize terminal")?;
-
-        Ok(Self { terminal })
+        let result = (|| {
+            let mut stdout = io::stdout();
+            execute!(stdout, EnterAlternateScreen).context("failed to enter alternate screen")?;
+            let backend = CrosstermBackend::new(stdout);
+            let terminal = Terminal::new(backend).context("failed to initialize terminal")?;
+            Ok(Self { terminal })
+        })();
+        // Drop cannot restore the terminal until a guard has been constructed.
+        if result.is_err() {
+            let _ = disable_raw_mode();
+            let _ = execute!(io::stdout(), LeaveAlternateScreen, crossterm::cursor::Show);
+        }
+        result
     }
 
     fn terminal_mut(&mut self) -> &mut AppTerminal {
@@ -1355,12 +1432,26 @@ impl Drop for TuiGuard {
 
 pub fn run(file_path: PathBuf, start_line: usize, image_protocol: ImageProtocol) -> Result<()> {
     let mut tui = TuiGuard::setup()?;
-    let mut picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::from_fontsize((10, 20)));
-    if let Some(protocol_type) = protocol_override(image_protocol) {
+    let picker = if let Some(protocol_type) = protocol_override(image_protocol) {
+        // Explicit choices must not launch a stdin capability probe: a terminal
+        // that never responds can leave that probe competing for keyboard input.
+        let font_size = crossterm::terminal::window_size()
+            .ok()
+            .and_then(|size| {
+                let width = size.width.checked_div(size.columns)?;
+                let height = size.height.checked_div(size.rows)?;
+                (width > 0 && height > 0).then_some((width, height))
+            })
+            .unwrap_or((10, 20));
+        let mut picker = Picker::from_fontsize(font_size);
         picker.set_protocol_type(protocol_type);
-    }
+        picker
+    } else {
+        Picker::from_query_stdio().unwrap_or_else(|_| Picker::from_fontsize((10, 20)))
+    };
     let mut app = App::new(file_path, start_line, picker)?;
     let mut should_redraw = true;
+    let mut last_content_width = None;
 
     loop {
         if app.drain_image_results() {
@@ -1385,6 +1476,16 @@ pub fn run(file_path: PathBuf, start_line: usize, image_protocol: ImageProtocol)
                 let content_inner = content_block.inner(chunks[0]);
                 let content_width = content_inner.width;
                 let viewport_height = usize::from(content_inner.height);
+                if let Some(old_width) = last_content_width {
+                    if old_width != content_width {
+                        app.reflow_cursor(old_width, content_width);
+                    }
+                } else {
+                    let line = start_line.saturating_sub(1).min(app.doc.lines.len().saturating_sub(1));
+                    app.cursor_row = app.virtual_row_for_doc_line(line, content_width);
+                    app.scroll = app.cursor_row;
+                }
+                last_content_width = Some(content_width);
                 let mut display_doc = app.build_display_doc(content_width);
                 let total_rows = display_doc.lines.len().max(1);
                 let total_doc_lines = app.doc.lines.len().max(1);
@@ -1401,14 +1502,14 @@ pub fn run(file_path: PathBuf, start_line: usize, image_protocol: ImageProtocol)
                     .copied()
                     .unwrap_or_else(|| app.doc.lines.len().saturating_sub(1));
                 let cursor_screen_row = cursor_virtual_row.saturating_sub(app.scroll);
-                let cursor_column = app.effective_cursor_column_for_line(cursor_doc_line);
+                let cursor_column = display_doc.lines.get(cursor_virtual_row)
+                    .map(|line| App::clamp_column(&line_plain_text(line), app.cursor_column)).unwrap_or(0);
 
                 app.apply_visual_selection_to_display_doc(&mut display_doc, content_width);
-                let text = Text::from(std::mem::take(&mut display_doc.lines));
-                let paragraph = Paragraph::new(text)
-                    .block(content_block)
-                    .wrap(Wrap { trim: false })
-                    .scroll((app.scroll as u16, 0));
+                // Layout already produced physical rows. Slice with usize so long
+                // documents do not wrap the scroll offset at 65,536 lines.
+                let text = viewport_text(std::mem::take(&mut display_doc.lines), app.scroll, viewport_height);
+                let paragraph = Paragraph::new(text).block(content_block);
 
                 frame.render_widget(paragraph, chunks[0]);
 
@@ -1638,6 +1739,10 @@ fn handle_key_event(
     half_page: usize,
     full_page: usize,
 ) -> bool {
+    // Raw mode disables the terminal's normal Ctrl-C handling, including in search.
+    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        return true;
+    }
     if let Mode::SearchInput(query) = &mut app.mode {
         match key.code {
             KeyCode::Esc => {
@@ -1729,12 +1834,11 @@ fn handle_key_event(
             false
         }
         (KeyCode::Char('h'), _) | (KeyCode::Left, _) => {
-            app.move_cursor_left();
+            app.move_cursor_left(content_width);
             false
         }
         (KeyCode::Char('l'), _) | (KeyCode::Right, _) => {
-            let cursor_doc_line = app.cursor_doc_line_for_navigation(content_width);
-            app.move_cursor_right(cursor_doc_line);
+            app.move_cursor_right(content_width);
             false
         }
         (KeyCode::Char('j'), _) | (KeyCode::Down, _) => {
@@ -1890,7 +1994,7 @@ fn image_resize_worker(
 }
 
 fn probe_local_image_dimensions(path: &Path) -> Option<(u32, u32)> {
-    let reader = ImageReader::open(path).ok()?;
+    let reader = ImageReader::open(path).ok()?.with_guessed_format().ok()?;
     reader.into_dimensions().ok()
 }
 
@@ -1899,7 +2003,12 @@ fn load_dynamic_image(
     remote_client: Option<&reqwest::blocking::Client>,
 ) -> Option<image::DynamicImage> {
     match source {
-        ResolvedImageSource::Local(path) => ImageReader::open(path).ok()?.decode().ok(),
+        ResolvedImageSource::Local(path) => ImageReader::open(path)
+            .ok()?
+            .with_guessed_format()
+            .ok()?
+            .decode()
+            .ok(),
         ResolvedImageSource::Remote(url) => {
             let client = remote_client?;
             let response = client.get(url).send().ok()?.error_for_status().ok()?;
@@ -1935,6 +2044,108 @@ fn resolve_image_source(markdown_path: &Path, src: &str) -> Option<ResolvedImage
                 .join(path),
         ))
     }
+}
+
+fn line_plain_text(line: &Line<'_>) -> String {
+    line.spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect::<String>()
+}
+
+fn highlight_lines(
+    lines: &[Line<'static>],
+    regex: &Regex,
+    active_match_line: Option<usize>,
+) -> Vec<Line<'static>> {
+    lines
+        .iter()
+        .enumerate()
+        .map(|(idx, line)| {
+            let line_text = line_plain_text(line);
+            let ranges = regex
+                .find_iter(&line_text)
+                .map(|m| (m.start(), m.end()))
+                .collect::<Vec<_>>();
+            if ranges.is_empty() {
+                return line.clone();
+            }
+
+            let highlight_style = if Some(idx) == active_match_line {
+                Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
+            } else {
+                Style::default().add_modifier(Modifier::REVERSED)
+            };
+
+            apply_highlight_ranges(line, &ranges, highlight_style)
+        })
+        .collect()
+}
+
+fn apply_highlight_ranges(
+    line: &Line<'static>,
+    ranges: &[(usize, usize)],
+    highlight_style: Style,
+) -> Line<'static> {
+    let mut out_spans: Vec<Span<'static>> = Vec::new();
+    let mut range_idx = 0usize;
+    let mut global_offset = 0usize;
+
+    for span in &line.spans {
+        let text = span.content.as_ref();
+        let span_start = global_offset;
+        let span_end = global_offset + text.len();
+        let mut local_cursor = 0usize;
+
+        while range_idx < ranges.len() {
+            let (match_start, match_end) = ranges[range_idx];
+
+            if match_end <= span_start {
+                range_idx += 1;
+                continue;
+            }
+
+            if match_start >= span_end {
+                break;
+            }
+
+            let overlap_start = match_start.max(span_start);
+            let overlap_end = match_end.min(span_end);
+            let overlap_local_start = overlap_start - span_start;
+            let overlap_local_end = overlap_end - span_start;
+
+            if overlap_local_start > local_cursor {
+                out_spans.push(Span::styled(
+                    text[local_cursor..overlap_local_start].to_string(),
+                    span.style,
+                ));
+            }
+
+            if overlap_local_end > overlap_local_start {
+                out_spans.push(Span::styled(
+                    text[overlap_local_start..overlap_local_end].to_string(),
+                    span.style.patch(highlight_style),
+                ));
+                local_cursor = overlap_local_end;
+            }
+
+            if match_end <= span_end {
+                range_idx += 1;
+            } else {
+                break;
+            }
+        }
+
+        if local_cursor < text.len() {
+            out_spans.push(Span::styled(text[local_cursor..].to_string(), span.style));
+        }
+
+        global_offset = span_end;
+    }
+
+    let mut out = line.clone();
+    out.spans = out_spans;
+    out
 }
 
 #[cfg(test)]
@@ -2005,6 +2216,133 @@ mod tests {
         }];
         app.image_index_by_line = BTreeMap::from([(8usize, 0usize)]);
         app
+    }
+
+    #[test]
+    fn resize_keeps_cursor_on_the_same_text() {
+        let mut app = test_app(2);
+        app.doc.lines[0] = Line::from("alpha beta gamma delta");
+        app.cursor_row = 1;
+        app.cursor_column = 6;
+        app.scroll = 1;
+        app.reflow_cursor(11, 30);
+        assert_eq!((app.cursor_row, app.cursor_column), (0, 17));
+        app.reflow_cursor(30, 11);
+        assert_eq!((app.cursor_row, app.cursor_column), (1, 6));
+        app.reflow_cursor(11, 0);
+        app.reflow_cursor(0, 11);
+        assert_eq!((app.cursor_row, app.cursor_column), (1, 6));
+    }
+
+    #[test]
+    fn wrapped_rows_drive_scrolling_search_and_selection() {
+        let mut app = test_app(2);
+        app.doc.lines = vec![Line::from("alpha beta gamma delta"), Line::from("last")];
+        let display = app.build_display_doc(11);
+        assert_eq!(
+            display
+                .lines
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            ["alpha beta ", "gamma delta", "last"]
+        );
+        assert_eq!(display.doc_line_for_row, [0, 0, 1]);
+        assert_eq!(app.total_virtual_lines(11), 3);
+        assert_eq!(app.total_virtual_lines(80), 2);
+        app.search("delta", 2, 11);
+        assert_eq!(
+            app.cursor_row, 1,
+            "search must reveal the row containing the match"
+        );
+        app.cursor_column = 4;
+        app.mode = Mode::VisualBlock(CursorPosition { row: 0, column: 0 });
+        assert_eq!(
+            app.visual_selection_text(11).as_deref(),
+            Some("alpha\ngamma")
+        );
+        app.jump_bottom(2, 11);
+        assert_eq!(app.cursor_row, 2);
+        assert_eq!(app.scroll, 1);
+    }
+
+    #[test]
+    fn wrapped_text_does_not_overlap_images() {
+        let mut app = app_with_image_for_navigation();
+        app.doc.lines[0] = Line::from("a".repeat(41));
+        let display = app.build_display_doc(20);
+        let plan = &display.image_plans[0];
+        assert_eq!(plan.start_row, 11);
+        let bounds = app.image_virtual_bounds(20);
+        assert_eq!(bounds[0].start_row, plan.start_row);
+        assert_eq!(bounds[0].end_row, plan.start_row + plan.height);
+        assert_eq!(app.virtual_row_for_doc_line(9, 20), bounds[0].end_row);
+        assert!(display.lines[plan.start_row..plan.start_row + plan.height]
+            .iter()
+            .all(|line| line.spans.is_empty()));
+    }
+
+    #[test]
+    fn word_motion_crosses_wrapped_rows_without_skipping_first_word() {
+        let mut app = test_app(1);
+        app.doc.lines[0] = Line::from("alpha beta gamma");
+        app.cursor_column = 6;
+        app.move_to_next_word(11, WordMotionKind::Small);
+        assert_eq!((app.cursor_row, app.cursor_column), (1, 0));
+        app.move_to_prev_word(11, WordMotionKind::Small);
+        assert_eq!((app.cursor_row, app.cursor_column), (0, 6));
+    }
+
+    #[test]
+    fn cursor_and_selection_respect_grapheme_boundaries() {
+        let mut app = test_app(1);
+        app.doc.lines[0] = Line::from("界e\u{301}👩‍💻!");
+        app.move_cursor_right(80);
+        assert_eq!(app.cursor_column, 2);
+        app.move_cursor_right(80);
+        assert_eq!(app.cursor_column, 3);
+        app.move_cursor_right(80);
+        assert_eq!(app.cursor_column, 5);
+        app.move_cursor_left(80);
+        assert_eq!(app.cursor_column, 3);
+        app.cursor_column = 0;
+        app.mode = Mode::VisualBlock(CursorPosition { row: 0, column: 0 });
+        assert_eq!(app.visual_selection_text(80).as_deref(), Some("界"));
+    }
+
+    #[test]
+    fn ctrl_c_quits_from_normal_search_and_visual_modes() {
+        let mut app = test_app(10);
+        for mode in [
+            Mode::Normal,
+            Mode::SearchInput("query".to_string()),
+            Mode::VisualBlock(CursorPosition { row: 0, column: 0 }),
+        ] {
+            app.mode = mode;
+            assert!(handle_key_event(
+                &mut app,
+                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+                10,
+                80,
+                5,
+                10,
+            ));
+        }
+    }
+
+    #[test]
+    fn local_images_are_detected_by_contents() {
+        let path = std::env::temp_dir().join(format!("mdvi-image-{}.data", std::process::id()));
+        let image = image::DynamicImage::new_rgb8(3, 2);
+        image
+            .save_with_format(&path, image::ImageFormat::Png)
+            .unwrap();
+        let dimensions = probe_local_image_dimensions(&path);
+        let loaded = load_dynamic_image(&ResolvedImageSource::Local(path.clone()), None);
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(dimensions, Some((3, 2)));
+        let loaded = loaded.expect("PNG should load even without a PNG extension");
+        assert_eq!((loaded.width(), loaded.height()), (3, 2));
     }
 
     #[test]
@@ -2586,7 +2924,7 @@ mod tests {
         let viewport_height = 20;
         let full_page = 20;
         let half_page = 10;
-        let cursor_doc_line = app.cursor_doc_line_for_navigation(80);
+        let cursor_doc_line = app.build_display_doc(80).doc_line_for_row[app.cursor_row];
         app.doc.lines[cursor_doc_line] = Line::from("abcdef");
 
         let _ = handle_key_event(
@@ -2626,7 +2964,7 @@ mod tests {
         let viewport_height = 20;
         let full_page = 20;
         let half_page = 10;
-        let cursor_doc_line = app.cursor_doc_line_for_navigation(80);
+        let cursor_doc_line = app.build_display_doc(80).doc_line_for_row[app.cursor_row];
         app.doc.lines[cursor_doc_line] = Line::from("abc");
 
         for _ in 0..10 {
@@ -2641,7 +2979,7 @@ mod tests {
         }
 
         assert_eq!(app.cursor_column, 2);
-        assert_eq!(app.effective_cursor_column_for_line(cursor_doc_line), 2);
+        assert_eq!(app.effective_cursor_column(80), 2);
     }
 
     #[test]
@@ -2740,7 +3078,7 @@ mod tests {
         }
 
         assert_eq!(app.cursor_column, 4);
-        assert_eq!(app.effective_cursor_column_for_line(0), 4);
+        assert_eq!(app.effective_cursor_column(80), 4);
     }
 
     #[test]
@@ -2877,104 +3215,4 @@ mod tests {
 
         assert_eq!(app.image_height_for(&image, 80), 0);
     }
-}
-
-fn line_plain_text(line: &Line<'_>) -> String {
-    line.spans
-        .iter()
-        .map(|span| span.content.as_ref())
-        .collect::<String>()
-}
-
-fn highlight_lines(
-    lines: &[Line<'static>],
-    regex: &Regex,
-    active_match_line: Option<usize>,
-) -> Vec<Line<'static>> {
-    lines
-        .iter()
-        .enumerate()
-        .map(|(idx, line)| {
-            let line_text = line_plain_text(line);
-            let ranges = regex
-                .find_iter(&line_text)
-                .map(|m| (m.start(), m.end()))
-                .collect::<Vec<_>>();
-            if ranges.is_empty() {
-                return line.clone();
-            }
-
-            let highlight_style = if Some(idx) == active_match_line {
-                Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
-            } else {
-                Style::default().add_modifier(Modifier::REVERSED)
-            };
-
-            apply_highlight_ranges(line, &ranges, highlight_style)
-        })
-        .collect()
-}
-
-fn apply_highlight_ranges(
-    line: &Line<'static>,
-    ranges: &[(usize, usize)],
-    highlight_style: Style,
-) -> Line<'static> {
-    let mut out_spans: Vec<Span<'static>> = Vec::new();
-    let mut range_idx = 0usize;
-    let mut global_offset = 0usize;
-
-    for span in &line.spans {
-        let text = span.content.as_ref();
-        let span_start = global_offset;
-        let span_end = global_offset + text.len();
-        let mut local_cursor = 0usize;
-
-        while range_idx < ranges.len() {
-            let (match_start, match_end) = ranges[range_idx];
-
-            if match_end <= span_start {
-                range_idx += 1;
-                continue;
-            }
-
-            if match_start >= span_end {
-                break;
-            }
-
-            let overlap_start = match_start.max(span_start);
-            let overlap_end = match_end.min(span_end);
-            let overlap_local_start = overlap_start - span_start;
-            let overlap_local_end = overlap_end - span_start;
-
-            if overlap_local_start > local_cursor {
-                out_spans.push(Span::styled(
-                    text[local_cursor..overlap_local_start].to_string(),
-                    span.style,
-                ));
-            }
-
-            if overlap_local_end > overlap_local_start {
-                out_spans.push(Span::styled(
-                    text[overlap_local_start..overlap_local_end].to_string(),
-                    span.style.patch(highlight_style),
-                ));
-                local_cursor = overlap_local_end;
-            }
-
-            if match_end <= span_end {
-                range_idx += 1;
-            } else {
-                break;
-            }
-        }
-
-        if local_cursor < text.len() {
-            out_spans.push(Span::styled(text[local_cursor..].to_string(), span.style));
-        }
-
-        global_offset = span_end;
-    }
-
-    Line::from(out_spans)
 }

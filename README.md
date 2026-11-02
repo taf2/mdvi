@@ -12,6 +12,8 @@ It renders markdown into a polished full-screen TUI with fast keyboard navigatio
 - Vim-style navigation controls
 - Visible cursor and `line:column` cursor position in the status bar
 - High-quality markdown rendering via `pulldown-cmark`
+- Word wrapping that keeps scrolling, search, selection, and inline images aligned
+- Unicode-aware layout and cursor movement, including wide characters and emoji
 - Support for:
   - headings
   - lists and task lists
@@ -19,9 +21,9 @@ It renders markdown into a polished full-screen TUI with fast keyboard navigatio
   - inline markdown images (`![alt](...)`) and HTML `<img ...>` tags
   - lazy image loading with immediate placeholder layout reservation
   - syntax-highlighted fenced code blocks and inline code
-  - links, tables, footnotes, emphasis/strong/strikethrough
+  - links, aligned tables with distinct headers, footnotes, emphasis/strong/strikethrough
 - Configurable image backend via `--image-protocol` (`auto`, `halfblocks`, `sixel`, `kitty`, `iterm2`)
-- Live reload (`r`) when the file changes on disk
+- Reload from disk on demand (`r`)
 - Start at specific line (`--line`)
 - Works with standard terminal keys (arrows, page up/down, home/end)
 
@@ -31,6 +33,11 @@ Notes:
 - On macOS, terminal-native image protocols can trigger an "Allow Terminal-Initiated Display?" prompt.
   Use `--image-protocol halfblocks` if you want image rendering without that dialog.
 - Fenced code blocks with language tags (for example, a block tagged `rust`) render with syntax highlighting.
+- Code blocks preserve blank lines and expand tabs to four-column stops.
+- Resizing the terminal keeps the cursor anchored to its text. An active rectangular
+  selection clears when the width changes because its screen coordinates change.
+
+Try the rendering showcase with `make run ARGS='examples/rendering.md'`.
 
 ## Install
 
@@ -43,14 +50,30 @@ brew install mdvi
 
 ### From source
 
+Install a current stable Rust toolchain (including Cargo), a C linker, and Make.
+From the project root, build an optimized binary with:
+
 ```bash
-cargo install --path .
+make
+./target/release/mdvi README.md
 ```
+
+The first build downloads dependencies and takes longer; subsequent builds reuse
+Cargo's cache. To install `mdvi` into Cargo's bin directory (usually `~/.cargo/bin`):
+
+```bash
+make install
+```
+
+If Make is unavailable, use `cargo build --release --locked` to build or
+`cargo install --locked --path .` to install. Ensure Cargo's bin directory is on
+your `PATH` when using the installed command.
 
 ### Run without install
 
 ```bash
-cargo run -- README.md
+make run
+make run ARGS='--image-protocol halfblocks README.md'
 ```
 
 ## Usage
@@ -71,6 +94,9 @@ mdvi --image-protocol halfblocks README.md
 
 - `j` / `Down`: scroll down one line
 - `k` / `Up`: scroll up one line
+- `h` / `Left`, `l` / `Right`: move the cursor horizontally
+- `w` / `b`: move to the next / previous word
+- `W` / `B`: move to the next / previous whitespace-delimited word
 - `d`: half-page down (less-style)
 - `u`: half-page up (less-style)
 - `Ctrl-d`: half-page down
@@ -85,8 +111,15 @@ mdvi --image-protocol halfblocks README.md
 - `/`: start search
 - `n`: next search match
 - `N`: previous search match
+- `Enter`: submit search; `Esc`: cancel search input
+- `Ctrl-v`: toggle rectangular selection; `y`: copy selection to the clipboard
+- `Esc`: clear rectangular selection
 - `?`: toggle help line
 - `q`: quit
+- `Ctrl-c`: quit from any mode
+
+Search is literal and case-insensitive. Submit an empty search to clear highlights.
+Clipboard copying requires a clipboard service supported by your environment.
 
 ## Why Rust?
 
@@ -94,16 +127,24 @@ Rust is a strong fit for a serious CLI viewer:
 
 - precise terminal control
 - excellent performance for large files
-- single static binary distribution
+- single executable distribution
 - mature ecosystem for TUI and markdown parsing
 
 ## Development
 
 ```bash
-cargo test
-cargo fmt
-cargo clippy -- -D warnings
+make help     # list all commands
+make check    # formatting check, tests, and Clippy (warnings are errors)
+make fmt      # format Rust source
+make test     # run tests only
+make debug    # faster development build in target/debug/mdvi
+make clean    # remove build artifacts
 ```
+
+Builds and tests use the committed `Cargo.lock` with `--locked` for reproducibility.
+CI runs checks and release builds on Linux and macOS. You can override Cargo with
+`make CARGO=/path/to/cargo`; standard Cargo environment variables such as
+`CARGO_TARGET_DIR` and `CARGO_BUILD_JOBS` are also respected.
 
 ## License
 

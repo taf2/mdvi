@@ -1300,7 +1300,8 @@ dependencies = [
  "regex",
  "reqwest",
  "syntect",
- "unicode-width 0.1.14",
+ "unicode-segmentation",
+ "unicode-width 0.2.0",
 ]
 
 [[package]]

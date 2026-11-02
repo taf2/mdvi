@@ -1,4 +1,5 @@
 mod app;
+mod layout;
 mod renderer;
 
 use std::path::PathBuf;

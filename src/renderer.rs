@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
@@ -11,6 +11,7 @@ use syntect::{
     highlighting::{FontStyle, Style as SyntectStyle, Theme, ThemeSet},
     parsing::SyntaxSet,
 };
+use unicode_width::UnicodeWidthStr;
 
 #[derive(Debug, Clone)]
 pub struct RenderedDoc {
@@ -43,6 +44,99 @@ struct HtmlImageTag {
     hinted_pixel_size: Option<(u32, u32)>,
 }
 
+/// Keep cells separate until every column's display width is known.
+struct TableLayout {
+    alignments: Vec<Alignment>,
+    rows: Vec<Vec<Line<'static>>>,
+    current_row: Vec<Line<'static>>,
+}
+
+impl TableLayout {
+    fn new(alignments: Vec<Alignment>) -> Self {
+        Self {
+            alignments,
+            rows: Vec::new(),
+            current_row: Vec::new(),
+        }
+    }
+
+    fn finish_row(&mut self) {
+        self.rows.push(std::mem::take(&mut self.current_row));
+    }
+
+    fn render(self) -> Vec<Line<'static>> {
+        let widths: Vec<usize> = (0..self.alignments.len())
+            .map(|column| {
+                self.rows
+                    .iter()
+                    .filter_map(|row| row.get(column))
+                    .map(Line::width)
+                    .max()
+                    .unwrap_or(0)
+                    .max(1)
+            })
+            .collect();
+        let border_style = Style::default().add_modifier(Modifier::DIM);
+        let border = |left: &str, joint: &str, right: &str| {
+            Line::from(Span::styled(
+                format!(
+                    "{left}{}{right}",
+                    widths
+                        .iter()
+                        .map(|w| "─".repeat(w + 2))
+                        .collect::<Vec<_>>()
+                        .join(joint)
+                ),
+                border_style,
+            ))
+        };
+        let mut lines = vec![border("┌", "┬", "┐")];
+        for (row_index, row) in self.rows.iter().enumerate() {
+            let mut spans = vec![Span::styled("│", border_style)];
+            for (column, width) in widths.iter().enumerate() {
+                let cell = row.get(column).cloned().unwrap_or_default();
+                let padding = width.saturating_sub(cell.width());
+                let left = match self.alignments[column] {
+                    Alignment::Right => padding,
+                    Alignment::Center => padding / 2,
+                    _ => 0,
+                };
+                spans.push(Span::raw(" ".repeat(left + 1)));
+                spans.extend(cell.spans.into_iter().map(|mut span| {
+                    if row_index == 0 {
+                        span.style = span.style.add_modifier(Modifier::BOLD);
+                    }
+                    span
+                }));
+                spans.push(Span::raw(" ".repeat(padding - left + 1)));
+                spans.push(Span::styled("│", border_style));
+            }
+            lines.push(Line::from(spans));
+            if row_index == 0 {
+                lines.push(border("├", "┼", "┤"));
+            }
+        }
+        lines.push(border("└", "┴", "┘"));
+        lines
+    }
+}
+
+fn expand_tabs(text: &str, tab_width: usize) -> String {
+    let mut out = String::new();
+    let mut column = 0;
+    for part in text.split_inclusive('\t') {
+        let content = part.trim_end_matches('\t');
+        out.push_str(content);
+        column += content.width();
+        if part.ends_with('\t') {
+            let spaces = tab_width - column % tab_width;
+            out.push_str(&" ".repeat(spaces));
+            column += spaces;
+        }
+    }
+    out
+}
+
 pub fn render_markdown(input: &str) -> Result<RenderedDoc> {
     let mut options = Options::empty();
     options.insert(Options::ENABLE_TABLES);
@@ -59,9 +153,11 @@ pub fn render_markdown(input: &str) -> Result<RenderedDoc> {
     let mut style_stack = vec![Style::default()];
     let mut list_stack: Vec<ListKind> = Vec::new();
     let mut in_code_block = false;
+    let mut code_text = String::new();
     let mut active_code_highlighter: Option<HighlightLines<'static>> = None;
-    let mut in_blockquote = 0usize;
-    let mut pending_link: Option<String> = None;
+    let mut blockquote_starts = Vec::new();
+    let mut pending_link: Option<(String, usize)> = None;
+    let mut table: Option<TableLayout> = None;
     let mut pending_image: Option<(String, String)> = None;
     let soft_break_as_space = true;
 
@@ -77,7 +173,7 @@ pub fn render_markdown(input: &str) -> Result<RenderedDoc> {
         if !spans.is_empty() {
             push_line(lines, spans);
         }
-        if !lines.last().map(|l| l.spans.is_empty()).unwrap_or(false) {
+        if lines.last().is_some_and(|l| !l.spans.is_empty()) {
             lines.push(Line::default());
         }
     }
@@ -171,14 +267,8 @@ pub fn render_markdown(input: &str) -> Result<RenderedDoc> {
                     style_stack.push(style);
                 }
                 Tag::BlockQuote(_) => {
-                    in_blockquote += 1;
-                    if current_spans.is_empty() {
-                        let prefix = format!("{}│ ", "  ".repeat(in_blockquote.saturating_sub(1)));
-                        current_spans.push(Span::styled(
-                            prefix,
-                            Style::default().add_modifier(Modifier::DIM),
-                        ));
-                    }
+                    blank_line(&mut lines, &mut current_spans);
+                    blockquote_starts.push(lines.len());
                 }
                 Tag::CodeBlock(kind) => {
                     blank_line(&mut lines, &mut current_spans);
@@ -246,22 +336,19 @@ pub fn render_markdown(input: &str) -> Result<RenderedDoc> {
                 Tag::Link { dest_url, .. } => {
                     let base = *style_stack.last().unwrap_or(&Style::default());
                     style_stack.push(base.add_modifier(Modifier::UNDERLINED));
-                    pending_link = Some(dest_url.to_string());
+                    pending_link = Some((dest_url.to_string(), current_spans.len()));
                 }
                 Tag::Image { dest_url, .. } => {
                     blank_line(&mut lines, &mut current_spans);
                     pending_image = Some((dest_url.to_string(), String::new()));
                 }
-                Tag::Table(_) => {
+                Tag::Table(alignments) => {
                     blank_line(&mut lines, &mut current_spans);
+                    table = Some(TableLayout::new(alignments));
                 }
                 Tag::TableHead => {}
                 Tag::TableRow => {}
-                Tag::TableCell => {
-                    if !current_spans.is_empty() {
-                        current_spans.push(Span::raw(" │ ".to_string()));
-                    }
-                }
+                Tag::TableCell => {}
                 Tag::FootnoteDefinition(name) => {
                     blank_line(&mut lines, &mut current_spans);
                     current_spans.push(Span::styled(
@@ -285,10 +372,25 @@ pub fn render_markdown(input: &str) -> Result<RenderedDoc> {
                     if !current_spans.is_empty() {
                         push_line(&mut lines, &mut current_spans);
                     }
-                    in_blockquote = in_blockquote.saturating_sub(1);
-                    lines.push(Line::default());
+                    if let Some(start) = blockquote_starts.pop() {
+                        for line in &mut lines[start..] {
+                            line.spans.insert(
+                                0,
+                                Span::styled("│ ", Style::default().add_modifier(Modifier::DIM)),
+                            );
+                        }
+                    }
+                    blank_line(&mut lines, &mut current_spans);
                 }
                 TagEnd::CodeBlock => {
+                    append_code_block_text(
+                        &code_text,
+                        &mut current_spans,
+                        &mut lines,
+                        &mut active_code_highlighter,
+                        Style::default(),
+                    );
+                    code_text.clear();
                     if !current_spans.is_empty() {
                         push_line(&mut lines, &mut current_spans);
                     }
@@ -302,54 +404,61 @@ pub fn render_markdown(input: &str) -> Result<RenderedDoc> {
                 }
                 TagEnd::List(_) => {
                     list_stack.pop();
-                    lines.push(Line::default());
+                    if list_stack.is_empty() {
+                        blank_line(&mut lines, &mut current_spans);
+                    }
                 }
                 TagEnd::Item => {
-                    push_line(&mut lines, &mut current_spans);
+                    if !current_spans.is_empty() {
+                        push_line(&mut lines, &mut current_spans);
+                    }
                 }
                 TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough => {
                     style_stack.pop();
                 }
                 TagEnd::Link => {
                     style_stack.pop();
-                    if let Some(link) = pending_link.take() {
-                        current_spans.push(Span::styled(
-                            format!(" ({link})"),
-                            Style::default().add_modifier(Modifier::DIM),
-                        ));
+                    if let Some((link, start)) = pending_link.take() {
+                        let label: String = current_spans
+                            .get(start..)
+                            .unwrap_or_default()
+                            .iter()
+                            .map(|s| s.content.as_ref())
+                            .collect();
+                        if label != link {
+                            current_spans.push(Span::styled(
+                                format!(" ({link})"),
+                                Style::default().add_modifier(Modifier::DIM),
+                            ));
+                        }
                     }
                 }
                 TagEnd::Image => {}
                 TagEnd::Table => {
-                    if !current_spans.is_empty() {
-                        push_line(&mut lines, &mut current_spans);
+                    if let Some(table) = table.take() {
+                        lines.extend(table.render());
                     }
-                    lines.push(Line::default());
+                    blank_line(&mut lines, &mut current_spans);
                 }
-                TagEnd::TableRow => {
-                    push_line(&mut lines, &mut current_spans);
+                TagEnd::TableHead | TagEnd::TableRow => {
+                    if let Some(table) = table.as_mut() {
+                        table.finish_row();
+                    }
                 }
-                TagEnd::TableCell => {}
+                TagEnd::TableCell => {
+                    if let Some(table) = table.as_mut() {
+                        table
+                            .current_row
+                            .push(Line::from(std::mem::take(&mut current_spans)));
+                    }
+                }
                 _ => {}
             },
             Event::Text(text) => {
                 let base = *style_stack.last().unwrap_or(&Style::default());
                 if in_code_block {
-                    append_code_block_text(
-                        text.as_ref(),
-                        &mut current_spans,
-                        &mut lines,
-                        &mut active_code_highlighter,
-                        base,
-                    );
+                    code_text.push_str(&text);
                 } else {
-                    if current_spans.is_empty() && in_blockquote > 0 {
-                        let prefix = format!("{}│ ", "  ".repeat(in_blockquote.saturating_sub(1)));
-                        current_spans.push(Span::styled(
-                            prefix,
-                            Style::default().add_modifier(Modifier::DIM),
-                        ));
-                    }
                     current_spans.push(Span::styled(text.to_string(), base));
                 }
             }
@@ -393,7 +502,7 @@ pub fn render_markdown(input: &str) -> Result<RenderedDoc> {
                 push_line(&mut lines, &mut current_spans);
             }
             Event::Rule => {
-                push_line(&mut lines, &mut current_spans);
+                blank_line(&mut lines, &mut current_spans);
                 lines.push(Line::from(Span::styled(
                     "─".repeat(72),
                     Style::default().add_modifier(Modifier::DIM),
@@ -535,13 +644,15 @@ fn append_code_block_text(
     base_style: Style,
 ) {
     let prefix_style = base_style.add_modifier(Modifier::DIM);
-    for line in text.split('\n') {
+    for line in text.split_inclusive('\n') {
+        let line = line.strip_suffix('\n').unwrap_or(line);
+        let line = expand_tabs(line, 4);
+        let highlighted = active_code_highlighter
+            .as_mut()
+            .map(|highlighter| highlight_code_line(&format!("{line}\n"), highlighter))
+            .unwrap_or_default();
         if !line.is_empty() {
             current_spans.push(Span::styled("  ".to_string(), prefix_style));
-            let highlighted = active_code_highlighter
-                .as_mut()
-                .map(|highlighter| highlight_code_line(line, highlighter))
-                .unwrap_or_default();
             if highlighted.is_empty() {
                 current_spans.push(Span::styled(line.to_string(), prefix_style));
             } else {
@@ -560,7 +671,11 @@ fn highlight_code_line(
     match highlighter.highlight_line(line, &assets.syntax_set) {
         Ok(highlighted) => highlighted
             .into_iter()
-            .map(|(style, text)| Span::styled(text.to_string(), syntect_style_to_ratatui(style)))
+            .filter_map(|(style, text)| {
+                let text = text.trim_end_matches('\n');
+                (!text.is_empty())
+                    .then(|| Span::styled(text.to_string(), syntect_style_to_ratatui(style)))
+            })
             .collect(),
         Err(_) => Vec::new(),
     }
@@ -670,6 +785,111 @@ fn first_non_empty_capture_owned(caps: &regex::Captures<'_>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn text(input: &str) -> Vec<String> {
+        render_markdown(input)
+            .unwrap()
+            .lines
+            .iter()
+            .map(ToString::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn tables_have_aligned_columns_distinct_headers_and_empty_cells() {
+        let markdown = "| Name | Count |\n| :--- | ---: |\n| 界 | 12 |\n| longer | |";
+        assert_eq!(
+            text(markdown),
+            [
+                "┌────────┬───────┐",
+                "│ Name   │ Count │",
+                "├────────┼───────┤",
+                "│ 界     │    12 │",
+                "│ longer │       │",
+                "└────────┴───────┘",
+            ]
+        );
+        let doc = render_markdown(markdown).unwrap();
+        assert!(doc
+            .lines
+            .iter()
+            .all(|line| line.width() == doc.lines[0].width()));
+        assert!(
+            doc.lines[1]
+                .spans
+                .iter()
+                .any(|span| span.content == "Name"
+                    && span.style.add_modifier.contains(Modifier::BOLD))
+        );
+    }
+
+    #[test]
+    fn table_cells_retain_inline_formatting() {
+        let doc = render_markdown("| A | B |\n|---|:---:|\n| **bold** | *italics* |").unwrap();
+        assert!(
+            doc.lines[3]
+                .spans
+                .iter()
+                .any(|span| span.content == "bold"
+                    && span.style.add_modifier.contains(Modifier::BOLD))
+        );
+        assert!(doc.lines[3]
+            .spans
+            .iter()
+            .any(|span| span.content == "italics"
+                && span.style.add_modifier.contains(Modifier::ITALIC)));
+    }
+
+    #[test]
+    fn code_blocks_preserve_blank_lines_and_expand_tabs() {
+        assert_eq!(
+            text("```text\nfirst\n\n\tthird\n```"),
+            ["```text", "  first", "", "      third", "```"]
+        );
+        assert_eq!(text("```\n```"), ["```", "```"]);
+    }
+
+    #[test]
+    fn code_highlighting_resets_single_line_comments() {
+        let doc = render_markdown("```rust\n// comment\nlet value = 42;\n```").unwrap();
+        let code: Vec<_> = doc.lines[2]
+            .spans
+            .iter()
+            .filter(|s| !s.content.trim().is_empty())
+            .collect();
+        assert!(
+            code.len() > 1,
+            "code after a comment must still be tokenized"
+        );
+        assert!(code.iter().any(|s| s.style != doc.lines[1].spans[1].style));
+    }
+
+    #[test]
+    fn nested_lists_do_not_insert_blank_rows_between_items() {
+        assert_eq!(
+            text("- parent\n  - child\n- sibling"),
+            ["• parent", "  • child", "• sibling"]
+        );
+    }
+
+    #[test]
+    fn quotes_decorate_nested_blocks_and_inline_code() {
+        let lines = text("> `code`  \n> next\n>\n> > nested\n>\n> - item");
+        assert_eq!(lines[0], "│ `code`");
+        assert!(lines.iter().any(|line| line == "│ next"));
+        assert!(lines.iter().any(|line| line == "│ │ nested"));
+        assert!(lines.iter().any(|line| line == "│ • item"));
+    }
+
+    #[test]
+    fn autolinks_are_not_duplicated() {
+        assert_eq!(text("<https://example.com>"), ["https://example.com"]);
+        assert_eq!(
+            text("[site](https://example.com)"),
+            ["site (https://example.com)"]
+        );
+        render_markdown("[![preview](image.png)](https://example.com)").unwrap();
+    }
 
     #[test]
     fn markdown_images_are_extracted_for_runtime_rendering() {
