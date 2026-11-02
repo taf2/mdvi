@@ -33,7 +33,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::{
-    layout::{viewport_text, wrap_line, wrapped_ranges},
+    layout::{clip_line, viewport_text, wrap_line, wrapped_ranges},
     renderer::{read_markdown_file, render_markdown, RenderedDoc},
     ImageProtocol,
 };
@@ -393,7 +393,9 @@ impl App {
         }
         let mut row = 0;
         for (line_index, line) in self.doc.lines.iter().enumerate() {
-            row += wrapped_ranges(&line_plain_text(line), content_width).len();
+            row += self
+                .line_ranges(line_index, &line_plain_text(line), content_width)
+                .len();
             if let Some(&image_index) = self.image_index_by_line.get(&line_index) {
                 let height = self.image_height_for(&self.images[image_index], content_width);
                 if height > 0 {
@@ -830,6 +832,7 @@ impl App {
 
         let target_row = self.virtual_row_for_search_match(self.search_matches[0], content_width);
         self.cursor_row = target_row;
+        self.reveal_table_match(content_width);
         let max_scroll = self.max_scroll(viewport_height, content_width);
         self.scroll = target_row.min(max_scroll);
         self.status = format!("{} matches for /{query}", self.search_matches.len());
@@ -846,6 +849,7 @@ impl App {
         let target_row = self
             .virtual_row_for_search_match(self.search_matches[self.active_match], content_width);
         self.cursor_row = target_row;
+        self.reveal_table_match(content_width);
         let max_scroll = self.max_scroll(viewport_height, content_width);
         self.scroll = target_row.min(max_scroll);
     }
@@ -865,8 +869,26 @@ impl App {
         let target_row = self
             .virtual_row_for_search_match(self.search_matches[self.active_match], content_width);
         self.cursor_row = target_row;
+        self.reveal_table_match(content_width);
         let max_scroll = self.max_scroll(viewport_height, content_width);
         self.scroll = target_row.min(max_scroll);
+    }
+
+    fn reveal_table_match(&mut self, width: u16) {
+        let Some(index) = self.active_match_line() else {
+            return;
+        };
+        if self.doc.tables.iter().any(|table| table.contains(&index)) {
+            let text = self.line_text_at(index);
+            if let Some(found) = self
+                .search_regex
+                .as_ref()
+                .and_then(|regex| regex.find(&text))
+            {
+                self.cursor_column = text[..found.start()].width();
+                self.cursor_row = self.virtual_row_for_doc_line(index, width);
+            }
+        }
     }
 
     fn active_match_line(&self) -> Option<usize> {
@@ -915,13 +937,45 @@ impl App {
         }
     }
 
+    fn line_ranges(&self, index: usize, text: &str, width: u16) -> Vec<std::ops::Range<usize>> {
+        if self.doc.tables.iter().any(|table| table.contains(&index)) {
+            std::iter::once(0..text.len()).collect()
+        } else {
+            wrapped_ranges(text, width)
+        }
+    }
+
+    // Clip only the active table, keeping all its rows at the same horizontal offset.
+    // Navigation and selection continue to use the complete, unwrapped rows.
+    fn pan_table(&self, display: &mut DisplayDoc, width: u16, column: usize) -> usize {
+        let Some(index) = display.doc_line_for_row.get(self.cursor_row) else {
+            return 0;
+        };
+        let Some(table) = self.doc.tables.iter().find(|table| table.contains(index)) else {
+            return 0;
+        };
+        let offset = column.saturating_sub(usize::from(width.saturating_sub(1)));
+        if offset > 0 {
+            for (line, index) in display.lines.iter_mut().zip(&display.doc_line_for_row) {
+                if table.contains(index) {
+                    *line = clip_line(line, offset, usize::from(width));
+                }
+            }
+        }
+        offset
+    }
+
     fn virtual_row_for_doc_line(&self, line_index: usize, content_width: u16) -> usize {
         let mut row = self
             .doc
             .lines
             .iter()
             .take(line_index)
-            .map(|line| wrapped_ranges(&line_plain_text(line), content_width).len())
+            .enumerate()
+            .map(|(index, line)| {
+                self.line_ranges(index, &line_plain_text(line), content_width)
+                    .len()
+            })
             .sum::<usize>();
         for image in &self.images {
             if image.line_index < line_index {
@@ -939,13 +993,13 @@ impl App {
         let screen_row = self.cursor_row.saturating_sub(self.scroll);
         let first_row = self.virtual_row_for_doc_line(line_index, old_width);
         let text = self.line_text_at(line_index);
-        let ranges = wrapped_ranges(&text, old_width);
+        let ranges = self.line_ranges(line_index, &text, old_width);
         let range = ranges
             .get(self.cursor_row.saturating_sub(first_row))
             .unwrap_or(&ranges[0]);
         let byte =
             range.start + Self::byte_index_for_column(&text[range.clone()], self.cursor_column);
-        let new_ranges = wrapped_ranges(&text, new_width);
+        let new_ranges = self.line_ranges(line_index, &text, new_width);
         let offset = new_ranges
             .iter()
             .position(|r| r.contains(&byte))
@@ -974,7 +1028,7 @@ impl App {
             .map(|m| m.start());
         let offset = match_start
             .and_then(|start| {
-                wrapped_ranges(&text, content_width)
+                self.line_ranges(line_index, &text, content_width)
                     .iter()
                     .position(|range| range.contains(&start))
             })
@@ -1366,7 +1420,16 @@ impl App {
         let mut doc_line_for_row: Vec<usize> = Vec::with_capacity(source_lines.len());
 
         for (line_index, line) in source_lines.into_iter().enumerate() {
-            let wrapped = wrap_line(&line, content_width);
+            let wrapped = if self
+                .doc
+                .tables
+                .iter()
+                .any(|table| table.contains(&line_index))
+            {
+                vec![line]
+            } else {
+                wrap_line(&line, content_width)
+            };
             doc_line_for_row.extend(std::iter::repeat_n(line_index, wrapped.len()));
             lines.extend(wrapped);
 
@@ -1506,6 +1569,7 @@ pub fn run(file_path: PathBuf, start_line: usize, image_protocol: ImageProtocol)
                     .map(|line| App::clamp_column(&line_plain_text(line), app.cursor_column)).unwrap_or(0);
 
                 app.apply_visual_selection_to_display_doc(&mut display_doc, content_width);
+                let horizontal_offset = app.pan_table(&mut display_doc, content_width, cursor_column);
                 // Layout already produced physical rows. Slice with usize so long
                 // documents do not wrap the scroll offset at 65,536 lines.
                 let text = viewport_text(std::mem::take(&mut display_doc.lines), app.scroll, viewport_height);
@@ -1673,7 +1737,7 @@ pub fn run(file_path: PathBuf, start_line: usize, image_protocol: ImageProtocol)
                                 content_inner.y.saturating_add(cursor_screen_row as u16);
                             let cursor_x = content_inner
                                 .x
-                                .saturating_add(cursor_column as u16)
+                                .saturating_add(cursor_column.saturating_sub(horizontal_offset) as u16)
                                 .min(content_inner.x + content_inner.width.saturating_sub(1));
                             frame.set_cursor_position((cursor_x, cursor_y));
                         }
@@ -2168,6 +2232,7 @@ mod tests {
             doc: RenderedDoc {
                 lines: doc_lines,
                 images: Vec::new(),
+                tables: Vec::new(),
             },
             picker: Picker::from_fontsize((8, 16)),
             images: Vec::new(),
@@ -2190,6 +2255,55 @@ mod tests {
             virtual_row_count_cache: BTreeMap::new(),
             highlighted_lines_cache: None,
         }
+    }
+
+    #[test]
+    fn wide_tables_keep_rows_aligned_and_pan_with_cursor() {
+        use ratatui::{backend::TestBackend, widgets::Paragraph};
+        let mut app = test_app(0);
+        app.doc = render_markdown("| Part | Notes |\n|---|---|\n| U1 voltage supply | A very long note about the voltage regulator |\n| C1 | Short |\n\nProse after the table wraps normally.").unwrap();
+        let table = app.doc.tables[0].clone();
+        let width = 20;
+        let mut display = app.build_display_doc(width);
+        assert_eq!(app.virtual_row_for_doc_line(table.end, width), table.end);
+        assert_eq!(
+            display.lines[table.start].width(),
+            display.lines[table.start + 3].width()
+        );
+        app.cursor_row = table.start + 3;
+        for _ in 0..30 {
+            app.move_cursor_right(width);
+        }
+        assert_eq!(app.cursor_column, 30);
+        let offset = app.pan_table(&mut display, width, app.cursor_column);
+        assert_eq!(offset, 11);
+        let mut terminal = Terminal::new(TestBackend::new(width, table.len() as u16)).unwrap();
+        terminal
+            .draw(|frame| {
+                frame.render_widget(
+                    Paragraph::new(viewport_text(
+                        display.lines.clone(),
+                        table.start,
+                        table.len(),
+                    )),
+                    frame.area(),
+                )
+            })
+            .unwrap();
+        // Both data rows retain the same column divider after horizontal clipping.
+        let row1 = line_plain_text(&display.lines[table.start + 3]);
+        let row2 = line_plain_text(&display.lines[table.start + 4]);
+        assert!(row1.contains('│'));
+        assert_eq!(row1.find('│'), row2.find('│'));
+        app.reflow_cursor(width, 30);
+        assert_eq!((app.cursor_row, app.cursor_column), (table.start + 3, 30));
+        app.search("regulator", 10, width);
+        assert_eq!(app.cursor_row, table.start + 3);
+        assert!(app.cursor_column > usize::from(width));
+        let mut display = app.build_display_doc(width);
+        let offset = app.pan_table(&mut display, width, app.cursor_column);
+        assert!(offset > 0);
+        assert!(line_plain_text(&display.lines[app.cursor_row]).ends_with('r'));
     }
 
     fn line_text(line: &Line<'static>) -> String {

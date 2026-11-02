@@ -95,6 +95,7 @@ mdvi --image-protocol halfblocks README.md
 - `j` / `Down`: scroll down one line
 - `k` / `Up`: scroll up one line
 - `h` / `Left`, `l` / `Right`: move the cursor horizontally
+- Wide tables keep their columns aligned; move right/left with `l`/`h` or the arrow keys to scroll across them.
 - `w` / `b`: move to the next / previous word
 - `W` / `B`: move to the next / previous whitespace-delimited word
 - `d`: half-page down (less-style)

@@ -74,6 +74,54 @@ pub fn wrap_line(line: &Line<'static>, width: u16) -> Vec<Line<'static>> {
         .collect()
 }
 
+/// Crop by terminal cells, padding partial wide glyphs to keep columns aligned.
+pub fn clip_line(line: &Line<'static>, left: usize, width: usize) -> Line<'static> {
+    let text: String = line
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect();
+    let mut out = Line::default().style(line.style);
+    let right = left.saturating_add(width);
+    let mut column = 0;
+    let mut span_index = 0;
+    let mut span_start = 0;
+    for (byte, grapheme) in text.grapheme_indices(true) {
+        let end_column = column + grapheme.width();
+        if column >= right {
+            break;
+        }
+        if end_column > left {
+            if column < left || end_column > right {
+                out.spans.push(ratatui::text::Span::raw(
+                    " ".repeat(end_column.min(right) - column.max(left)),
+                ));
+            } else {
+                let end = byte + grapheme.len();
+                while span_index < line.spans.len() {
+                    let span = &line.spans[span_index];
+                    let span_end = span_start + span.content.len();
+                    let from = byte.max(span_start);
+                    let to = end.min(span_end);
+                    if from < to {
+                        out.spans.push(ratatui::text::Span::styled(
+                            text[from..to].to_string(),
+                            span.style,
+                        ));
+                    }
+                    if span_end >= end {
+                        break;
+                    }
+                    span_start = span_end;
+                    span_index += 1;
+                }
+            }
+        }
+        column = end_column;
+    }
+    out
+}
+
 pub fn viewport_text(lines: Vec<Line<'static>>, scroll: usize, height: usize) -> Text<'static> {
     Text::from(
         lines
@@ -91,6 +139,17 @@ mod tests {
         style::{Modifier, Style},
         text::Span,
     };
+
+    #[test]
+    fn horizontal_clipping_preserves_cells_and_styles() {
+        let style = Style::default().add_modifier(Modifier::BOLD);
+        let line = Line::from(vec![Span::raw("ab"), Span::styled("界e\u{301}xyz", style)]);
+        let clipped = clip_line(&line, 3, 4);
+        assert_eq!(clipped.to_string(), " e\u{301}xy");
+        assert_eq!(clipped.width(), 4);
+        assert_eq!(clipped.spans.last().unwrap().style, style);
+        assert_eq!(clip_line(&line, 1, 2).to_string(), "b ");
+    }
 
     #[test]
     fn wraps_words_without_losing_text_or_styles() {

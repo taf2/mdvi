@@ -17,6 +17,7 @@ use unicode_width::UnicodeWidthStr;
 pub struct RenderedDoc {
     pub lines: Vec<Line<'static>>,
     pub images: Vec<RenderedImage>,
+    pub tables: Vec<std::ops::Range<usize>>,
 }
 
 #[derive(Debug, Clone)]
@@ -158,6 +159,7 @@ pub fn render_markdown(input: &str) -> Result<RenderedDoc> {
     let mut blockquote_starts = Vec::new();
     let mut pending_link: Option<(String, usize)> = None;
     let mut table: Option<TableLayout> = None;
+    let mut tables = Vec::new();
     let mut pending_image: Option<(String, String)> = None;
     let soft_break_as_space = true;
 
@@ -436,7 +438,9 @@ pub fn render_markdown(input: &str) -> Result<RenderedDoc> {
                 TagEnd::Image => {}
                 TagEnd::Table => {
                     if let Some(table) = table.take() {
+                        let start = lines.len();
                         lines.extend(table.render());
+                        tables.push(start..lines.len());
                     }
                     blank_line(&mut lines, &mut current_spans);
                 }
@@ -571,7 +575,11 @@ pub fn render_markdown(input: &str) -> Result<RenderedDoc> {
         )));
     }
 
-    Ok(RenderedDoc { lines, images })
+    Ok(RenderedDoc {
+        lines,
+        images,
+        tables,
+    })
 }
 
 fn code_highlight_assets() -> &'static CodeHighlightAssets {
