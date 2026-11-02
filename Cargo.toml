@@ -22,6 +22,8 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 syntect = { version = "5.3", default-features = false, features = ["default-fancy"] }
 unicode-width = "0.2"
 unicode-segmentation = "1.12"
+resvg = "0.49"
+libc = "0.2"
 
 [profile.release]
 lto = true

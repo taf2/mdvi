@@ -4,6 +4,20 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- SVG image support (local and remote), rasterized with `resvg`.
+- Text-mode image renderer (`--image-protocol symbols`, default when no graphics protocol is
+  available): per-cell best fit over sextant, quadrant and eighth-block glyphs, with SVG text
+  drawn as real terminal characters.
+- Status bar hint with the `gsettings` command to enable SIXEL in GNOME Terminal.
+
+### Fixed
+- Images were downscaled with nearest-neighbour sampling; they are now pre-fitted with Lanczos.
+- Images were capped at 18 rows; the cap now scales with the viewport height.
+- Partially scrolled images no longer jump to an unscaled crop.
+- Cell pixel size is measured from the window size when the terminal doesn't report it
+  (e.g. VTE), instead of assuming 10x20.
+
 ## [0.6.8] - 2026-11-02
 
 ### Fixed

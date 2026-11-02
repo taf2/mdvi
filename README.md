@@ -22,7 +22,10 @@ It renders markdown into a polished full-screen TUI with fast keyboard navigatio
   - lazy image loading with immediate placeholder layout reservation
   - syntax-highlighted fenced code blocks and inline code
   - links, aligned tables with distinct headers, footnotes, emphasis/strong/strikethrough
-- Configurable image backend via `--image-protocol` (`auto`, `halfblocks`, `sixel`, `kitty`, `iterm2`)
+- Configurable image backend via `--image-protocol` (`auto`, `symbols`, `halfblocks`, `sixel`, `kitty`, `iterm2`)
+- SVG images, rasterized with `resvg`
+- High-detail text-mode images when the terminal has no graphics protocol: each cell picks the best
+  of sextant, quadrant and eighth-block glyphs, and SVG text is drawn as real, crisp terminal text
 - Reload from disk on demand (`r`)
 - Start at specific line (`--line`)
 - Works with standard terminal keys (arrows, page up/down, home/end)
@@ -31,7 +34,9 @@ Notes:
 - Local, `file://`, and remote `http://` / `https://` image sources are supported.
 - HTML `<img>` `width` and `height` hints are used to reserve image space before lazy loading finishes.
 - On macOS, terminal-native image protocols can trigger an "Allow Terminal-Initiated Display?" prompt.
-  Use `--image-protocol halfblocks` if you want image rendering without that dialog.
+  Use `--image-protocol symbols` if you want image rendering without that dialog.
+- GNOME Terminal ships with SIXEL disabled; mdvi then uses text-mode images and shows the
+  `gsettings` command that enables full-resolution images in the status bar.
 - Fenced code blocks with language tags (for example, a block tagged `rust`) render with syntax highlighting.
 - Code blocks preserve blank lines and expand tabs to four-column stops.
 - Resizing the terminal keeps the cursor anchored to its text. An active rectangular
@@ -73,7 +78,7 @@ your `PATH` when using the installed command.
 
 ```bash
 make run
-make run ARGS='--image-protocol halfblocks README.md'
+make run ARGS='--image-protocol symbols README.md'
 ```
 
 ## Usage
@@ -87,7 +92,7 @@ Examples:
 ```bash
 mdvi docs/spec.md
 mdvi --line 120 CHANGELOG.md
-mdvi --image-protocol halfblocks README.md
+mdvi --image-protocol symbols README.md
 ```
 
 ## Navigation

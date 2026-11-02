@@ -7,6 +7,7 @@ use std::{
     time::Duration,
 };
 
+use crate::cellart::{CellArt, CellArtMode, LabelAnchor, TextLabel};
 use anyhow::{Context, Result};
 use arboard::Clipboard;
 use crossterm::{
@@ -67,6 +68,9 @@ struct App {
     image_resize_tx: Sender<ImageResizeRequest>,
     image_resize_rx: Receiver<ImageResizeResult>,
     virtual_row_count_cache: BTreeMap<u16, usize>,
+    image_max_rows: usize,
+    /// Set when images are drawn with Unicode block glyphs instead of a graphics protocol.
+    text_image_mode: Option<CellArtMode>,
     highlighted_lines_cache: Option<HighlightedLinesCache>,
 }
 
@@ -83,6 +87,16 @@ struct InlineImage {
     pixel_size: Option<(u32, u32)>,
     hinted_pixel_size: Option<(u32, u32)>,
     load_state: ImageLoadState,
+    /// Full-resolution decoded image; protocols are built from a copy fitted to the layout box.
+    source_image: Option<image::DynamicImage>,
+    /// (content width, rows) the current protocols were fitted for.
+    fitted_for: Option<(u16, usize)>,
+    /// Bumped whenever protocols are rebuilt so stale resize results can be discarded.
+    generation: u64,
+    /// Pre-rendered text-mode cells, used when the terminal has no pixel graphics protocol.
+    cell_art: Option<CellArt>,
+    /// Text pulled out of vector images, drawn as terminal characters in text mode.
+    text_labels: Vec<TextLabel>,
 }
 
 struct ImageRenderPlan {
@@ -150,13 +164,14 @@ struct ImageLoadResult {
 #[derive(Debug, Clone)]
 enum ImageLoadJob {
     ProbeLocalDimensions(PathBuf),
-    LoadImage(ResolvedImageSource),
+    /// The flag asks for SVG text as [`TextLabel`]s (and a raster without it) for text mode.
+    LoadImage(ResolvedImageSource, bool),
 }
 
 #[derive(Debug)]
 enum ImageLoadResultPayload {
     ProbedDimensions(Option<(u32, u32)>),
-    LoadedImage(Option<image::DynamicImage>),
+    LoadedImage(Option<image::DynamicImage>, Vec<TextLabel>),
 }
 
 struct ImageResizeRequest {
@@ -165,12 +180,14 @@ struct ImageResizeRequest {
     resize: Resize,
     area: Rect,
     protocol: StatefulProtocol,
+    generation: u64,
 }
 
 struct ImageResizeResult {
     image_index: usize,
     variant: ImageResizeVariant,
     protocol: StatefulProtocol,
+    generation: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -248,6 +265,8 @@ impl App {
             image_resize_tx,
             image_resize_rx,
             virtual_row_count_cache: BTreeMap::new(),
+            image_max_rows: 18,
+            text_image_mode: None,
             highlighted_lines_cache: None,
         };
         app.request_local_dimension_probes();
@@ -1050,8 +1069,6 @@ impl App {
     }
 
     fn image_height_for(&self, image: &InlineImage, content_width: u16) -> usize {
-        const MAX_IMAGE_CELL_HEIGHT: usize = 18;
-
         let Some((pixel_width, pixel_height)) = self.effective_image_pixel_size(image) else {
             return 0;
         };
@@ -1069,7 +1086,79 @@ impl App {
             .div_ceil(u64::from(pixel_width)) as u32;
         let height_cells = target_pixel_height.div_ceil(font_height).max(1) as usize;
 
-        height_cells.min(MAX_IMAGE_CELL_HEIGHT)
+        height_cells.min(self.image_max_rows)
+    }
+
+    /// Images may use most of the viewport so diagrams stay legible, but never
+    /// less than the historical 18-row allowance (when the viewport has room).
+    fn set_viewport_height(&mut self, viewport_height: usize) {
+        const MIN_IMAGE_CELL_HEIGHT: usize = 18;
+        let max_rows = (viewport_height * 4 / 5)
+            .max(MIN_IMAGE_CELL_HEIGHT.min(viewport_height))
+            .max(1);
+        if max_rows != self.image_max_rows {
+            self.image_max_rows = max_rows;
+            self.invalidate_virtual_row_cache();
+        }
+    }
+
+    /// Downscale the decoded image once, with a high-quality filter, to the exact pixel
+    /// box its layout rows occupy. Terminal protocols then only crop or no-op resize it,
+    /// which avoids nearest-neighbor artifacts and keeps partially scrolled images at the
+    /// same scale as fully visible ones.
+    fn fit_image_to_layout(&mut self, image_index: usize, content_width: u16, rows: usize) {
+        let (font_width, font_height) = self.picker.font_size();
+        let Some(image) = self.images.get_mut(image_index) else {
+            return;
+        };
+        if image.fitted_for == Some((content_width, rows)) {
+            return;
+        }
+        let Some(source) = image.source_image.as_ref() else {
+            return;
+        };
+        let box_width = u32::from(content_width) * u32::from(font_width.max(1));
+        let box_height = rows as u32 * u32::from(font_height.max(1));
+
+        if let Some(mode) = self.text_image_mode {
+            // Size in cells from the on-screen pixel box, so the cell aspect ratio is honoured.
+            let (width, height) = (source.width().max(1), source.height().max(1));
+            let scale = (f64::from(box_width) / f64::from(width))
+                .min(f64::from(box_height) / f64::from(height))
+                .min(1.0);
+            let cols = ((f64::from(width) * scale) / f64::from(font_width.max(1)))
+                .round()
+                .clamp(1.0, f64::from(content_width.max(1))) as u16;
+            let art_rows = ((f64::from(height) * scale) / f64::from(font_height.max(1)))
+                .round()
+                .clamp(1.0, rows.max(1) as f64) as u16;
+            image.cell_art = Some(CellArt::render(
+                source,
+                cols,
+                art_rows,
+                mode,
+                &image.text_labels,
+            ));
+            image.fitted_for = Some((content_width, rows));
+            image.state = None;
+            image.scratch_state = None;
+            image.cached_variants.clear();
+            image.resize_pending = false;
+            image.pending_variant = None;
+            return;
+        }
+
+        let fitted = fit_image_within(source, box_width, box_height);
+
+        image.state = Some(self.picker.new_resize_protocol(fitted.clone()));
+        image.scratch_state = Some(self.picker.new_resize_protocol(fitted));
+        image.fitted_for = Some((content_width, rows));
+        image.generation = image.generation.wrapping_add(1);
+        image.active_variant = None;
+        image.cached_variants.clear();
+        image.resize_pending = false;
+        image.pending_variant = None;
+        image.has_encoded_state = false;
     }
 
     fn image_progress_counts(&self) -> (usize, usize, usize) {
@@ -1112,7 +1201,7 @@ impl App {
             .image_loader_tx
             .send(ImageLoadRequest {
                 image_index,
-                job: ImageLoadJob::LoadImage(source),
+                job: ImageLoadJob::LoadImage(source, self.text_image_mode.is_some()),
             })
             .is_ok()
         {
@@ -1300,6 +1389,7 @@ impl App {
             resize,
             area: target_area,
             protocol,
+            generation: image.generation,
         }) {
             Ok(()) => {
                 image.resize_pending = true;
@@ -1323,6 +1413,10 @@ impl App {
             let Some(image) = self.images.get_mut(result.image_index) else {
                 continue;
             };
+            if result.generation != image.generation {
+                // Encoded from a source that has since been re-fitted; drop it.
+                continue;
+            }
             let was_pending_variant = image.pending_variant == Some(result.variant);
             image.resize_pending = false;
             image.pending_variant = None;
@@ -1374,10 +1468,15 @@ impl App {
             };
 
             match result.payload {
-                ImageLoadResultPayload::LoadedImage(Some(dynamic_image)) => {
+                ImageLoadResultPayload::LoadedImage(Some(dynamic_image), labels) => {
+                    image.text_labels = labels;
                     image.pixel_size = Some((dynamic_image.width(), dynamic_image.height()));
                     image.state = Some(self.picker.new_resize_protocol(dynamic_image.clone()));
-                    image.scratch_state = Some(self.picker.new_resize_protocol(dynamic_image));
+                    image.scratch_state = None;
+                    image.source_image = Some(dynamic_image);
+                    image.cell_art = None;
+                    image.fitted_for = None;
+                    image.generation = image.generation.wrapping_add(1);
                     image.active_variant = None;
                     image.cached_variants.clear();
                     image.resize_pending = false;
@@ -1386,8 +1485,11 @@ impl App {
                     image.load_state = ImageLoadState::Loaded;
                     changed = true;
                 }
-                ImageLoadResultPayload::LoadedImage(None) => {
+                ImageLoadResultPayload::LoadedImage(None, _) => {
                     image.state = None;
+                    image.source_image = None;
+                    image.cell_art = None;
+                    image.fitted_for = None;
                     image.scratch_state = None;
                     image.active_variant = None;
                     image.cached_variants.clear();
@@ -1498,21 +1600,31 @@ pub fn run(file_path: PathBuf, start_line: usize, image_protocol: ImageProtocol)
     let picker = if let Some(protocol_type) = protocol_override(image_protocol) {
         // Explicit choices must not launch a stdin capability probe: a terminal
         // that never responds can leave that probe competing for keyboard input.
-        let font_size = crossterm::terminal::window_size()
-            .ok()
-            .and_then(|size| {
-                let width = size.width.checked_div(size.columns)?;
-                let height = size.height.checked_div(size.rows)?;
-                (width > 0 && height > 0).then_some((width, height))
-            })
+        // The window-size query is bounded by a device-attributes reply, so unlike a full
+        // capability probe it cannot leave a pending read competing for keyboard input.
+        let font_size = window_cell_size()
+            .or_else(query_cell_size_from_window_pixels)
             .unwrap_or((10, 20));
         let mut picker = Picker::from_fontsize(font_size);
         picker.set_protocol_type(protocol_type);
         picker
     } else {
-        Picker::from_query_stdio().unwrap_or_else(|_| Picker::from_fontsize((10, 20)))
+        let picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::from_fontsize((10, 20)));
+        with_measured_cell_size(picker)
     };
+    let uses_text_images = app_uses_text_images(&picker);
     let mut app = App::new(file_path, start_line, picker)?;
+    if uses_text_images {
+        app.text_image_mode = Some(match image_protocol {
+            ImageProtocol::Halfblocks => CellArtMode::HalfBlocks,
+            _ => CellArtMode::Mosaic,
+        });
+        if matches!(image_protocol, ImageProtocol::Auto) && !app.images.is_empty() {
+            if let Some(hint) = graphics_upgrade_hint() {
+                app.status = hint;
+            }
+        }
+    }
     let mut should_redraw = true;
     let mut last_content_width = None;
 
@@ -1539,6 +1651,7 @@ pub fn run(file_path: PathBuf, start_line: usize, image_protocol: ImageProtocol)
                 let content_inner = content_block.inner(chunks[0]);
                 let content_width = content_inner.width;
                 let viewport_height = usize::from(content_inner.height);
+                app.set_viewport_height(viewport_height);
                 if let Some(old_width) = last_content_width {
                     if old_width != content_width {
                         app.reflow_cursor(old_width, content_width);
@@ -1606,8 +1719,24 @@ pub fn run(file_path: PathBuf, start_line: usize, image_protocol: ImageProtocol)
                         continue;
                     }
                     frame.render_widget(Clear, image_area);
+                    app.fit_image_to_layout(plan.image_index, content_width, plan.height);
+                    if app.text_image_mode.is_some() {
+                        if let Some(art) = app.images[plan.image_index].cell_art.as_ref() {
+                            art.draw(visible_top - plan_top, image_area, frame.buffer_mut());
+                        } else {
+                            let placeholder = App::image_placeholder(&app.images[plan.image_index]);
+                            frame.render_widget(
+                                Paragraph::new(Line::from(Span::styled(
+                                    format!("  {placeholder}"),
+                                    Style::default().add_modifier(Modifier::DIM),
+                                ))),
+                                image_area,
+                            );
+                        }
+                    } else {
                     let resize = if is_fully_visible {
-                        Resize::Fit(None)
+                        // Images are pre-fitted with Lanczos; this only guards against rounding.
+                        Resize::Fit(Some(ratatui_image::FilterType::Lanczos3))
                     } else {
                         Resize::Crop(Some(CropOptions {
                             clip_top: visible_top > plan_top,
@@ -1642,6 +1771,7 @@ pub fn run(file_path: PathBuf, start_line: usize, image_protocol: ImageProtocol)
                             ))),
                             image_area,
                         );
+                    }
                     }
 
                     if app.focused_image == Some(plan.image_index) {
@@ -1785,10 +1915,141 @@ pub fn run(file_path: PathBuf, start_line: usize, image_protocol: ImageProtocol)
     Ok(())
 }
 
+/// Cell size in pixels from the tty's winsize, when the terminal fills in pixel fields.
+fn window_cell_size() -> Option<(u16, u16)> {
+    let size = crossterm::terminal::window_size().ok()?;
+    let width = size.width.checked_div(size.columns)?;
+    let height = size.height.checked_div(size.rows)?;
+    (width > 0 && height > 0).then_some((width, height))
+}
+
+/// ratatui-image learns the cell size from `CSI 16 t` or the winsize pixel fields and
+/// otherwise silently assumes 10x20. Several terminals (e.g. VTE-based ones) answer
+/// neither, which makes every bitmap the wrong scale. Fill the gap portably.
+fn with_measured_cell_size(picker: Picker) -> Picker {
+    let reported = picker
+        .capabilities()
+        .iter()
+        .any(|cap| matches!(cap, ratatui_image::picker::Capability::CellSize(Some(_))));
+    if reported || window_cell_size().is_some() {
+        return picker;
+    }
+    let Some(font_size) = query_cell_size_from_window_pixels() else {
+        return picker;
+    };
+    let mut measured = Picker::from_fontsize(font_size);
+    measured.set_protocol_type(picker.protocol_type());
+    measured
+}
+
+/// Ask for the text area size in pixels (`CSI 14 t`) and divide by the size in cells.
+/// A trailing primary device attributes query (`CSI c`), which every terminal answers,
+/// bounds the read so nothing is left behind to be mistaken for keyboard input.
+#[cfg(unix)]
+fn query_cell_size_from_window_pixels() -> Option<(u16, u16)> {
+    use std::io::{Read, Write};
+    use std::os::fd::AsRawFd;
+
+    let (columns, rows) = crossterm::terminal::size().ok()?;
+    if columns == 0 || rows == 0 {
+        return None;
+    }
+    let mut stdout = io::stdout();
+    stdout.write_all(b"\x1b[14t\x1b[c").ok()?;
+    stdout.flush().ok()?;
+
+    let stdin = io::stdin();
+    let fd = stdin.as_raw_fd();
+    let deadline = std::time::Instant::now() + Duration::from_millis(500);
+    let mut response = Vec::new();
+    let mut buf = [0u8; 64];
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let mut pollfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: pollfd points at one valid, initialized pollfd for the duration of the call.
+        let ready = unsafe { libc::poll(&mut pollfd, 1, remaining.as_millis() as libc::c_int) };
+        if ready <= 0 {
+            break;
+        }
+        let read = stdin.lock().read(&mut buf).ok()?;
+        if read == 0 {
+            break;
+        }
+        response.extend_from_slice(&buf[..read]);
+        if parse_device_attributes_end(&response) {
+            break;
+        }
+    }
+    let (height, width) = parse_window_pixel_report(&response)?;
+    let cell = (width / columns, height / rows);
+    (cell.0 > 0 && cell.1 > 0).then_some(cell)
+}
+
+#[cfg(not(unix))]
+fn query_cell_size_from_window_pixels() -> Option<(u16, u16)> {
+    None
+}
+
+fn parse_device_attributes_end(response: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(response);
+    text.find("\x1b[?")
+        .is_some_and(|start| text[start..].contains('c'))
+}
+
+/// Parse `ESC [ 4 ; height ; width t` out of a terminal response.
+fn parse_window_pixel_report(response: &[u8]) -> Option<(u16, u16)> {
+    let text = String::from_utf8_lossy(response);
+    let start = text.find("\x1b[4;")? + 4;
+    let end = start + text[start..].find('t')?;
+    let (height, width) = text[start..end].split_once(';')?;
+    Some((height.parse().ok()?, width.parse().ok()?))
+}
+
+fn app_uses_text_images(picker: &Picker) -> bool {
+    picker.protocol_type() == ProtocolType::Halfblocks
+}
+
+/// Terminals that can show real pixels but have it switched off get a one-line hint.
+/// GNOME Terminal (VTE) ships with SIXEL disabled per profile.
+fn graphics_upgrade_hint() -> Option<String> {
+    std::env::var_os("VTE_VERSION")?;
+    if std::env::var_os("GNOME_TERMINAL_SCREEN").is_none()
+        && std::env::var_os("GNOME_TERMINAL_SERVICE").is_none()
+    {
+        return Some(
+            "images in text mode; enable SIXEL in your terminal for full resolution".to_string(),
+        );
+    }
+    let output = std::process::Command::new("gsettings")
+        .args(["get", "org.gnome.Terminal.ProfilesList", "default"])
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    let profile = String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .trim_matches('\'')
+        .to_string();
+    if profile.is_empty() || !profile.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
+        return Some(
+            "images in text mode; enable SIXEL in GNOME Terminal for full resolution".to_string(),
+        );
+    }
+    Some(format!(
+        "images in text mode; for full resolution run: gsettings set org.gnome.Terminal.Legacy.Profile:/org/gnome/terminal/legacy/profiles:/:{profile}/ enable-sixel true  (then reopen mdvi)"
+    ))
+}
+
 fn protocol_override(image_protocol: ImageProtocol) -> Option<ProtocolType> {
     match image_protocol {
         ImageProtocol::Auto => None,
-        ImageProtocol::Halfblocks => Some(ProtocolType::Halfblocks),
+        ImageProtocol::Symbols | ImageProtocol::Halfblocks => Some(ProtocolType::Halfblocks),
         ImageProtocol::Sixel => Some(ProtocolType::Sixel),
         ImageProtocol::Kitty => Some(ProtocolType::Kitty),
         ImageProtocol::Iterm2 => Some(ProtocolType::Iterm2),
@@ -1980,6 +2241,11 @@ fn prepare_images_for_doc(markdown_path: &Path, doc: &RenderedDoc) -> Vec<Inline
                 has_encoded_state: false,
                 pixel_size: None,
                 hinted_pixel_size: image.hinted_pixel_size,
+                source_image: None,
+                fitted_for: None,
+                generation: 0,
+                cell_art: None,
+                text_labels: Vec::new(),
                 load_state,
             }
         })
@@ -2009,9 +2275,14 @@ fn image_loader_worker(request_rx: Receiver<ImageLoadRequest>, result_tx: Sender
             ImageLoadJob::ProbeLocalDimensions(path) => {
                 ImageLoadResultPayload::ProbedDimensions(probe_local_image_dimensions(&path))
             }
-            ImageLoadJob::LoadImage(source) => ImageLoadResultPayload::LoadedImage(
-                load_dynamic_image(&source, remote_client.as_ref()),
-            ),
+            ImageLoadJob::LoadImage(source, svg_text_as_labels) => {
+                match load_image(&source, remote_client.as_ref(), svg_text_as_labels) {
+                    Some((image, labels)) => {
+                        ImageLoadResultPayload::LoadedImage(Some(image), labels)
+                    }
+                    None => ImageLoadResultPayload::LoadedImage(None, Vec::new()),
+                }
+            }
         };
         if result_tx
             .send(ImageLoadResult {
@@ -2049,6 +2320,7 @@ fn image_resize_worker(
                 image_index: request.image_index,
                 variant: request.variant,
                 protocol: request.protocol,
+                generation: request.generation,
             })
             .is_err()
         {
@@ -2058,28 +2330,241 @@ fn image_resize_worker(
 }
 
 fn probe_local_image_dimensions(path: &Path) -> Option<(u32, u32)> {
+    if path_looks_like_svg(path) {
+        let tree = parse_svg(&std::fs::read(path).ok()?)?;
+        let (width, height, _) = svg_raster_size(&tree);
+        return Some((width, height));
+    }
     let reader = ImageReader::open(path).ok()?.with_guessed_format().ok()?;
     reader.into_dimensions().ok()
 }
 
+#[cfg(test)]
 fn load_dynamic_image(
     source: &ResolvedImageSource,
     remote_client: Option<&reqwest::blocking::Client>,
 ) -> Option<image::DynamicImage> {
-    match source {
-        ResolvedImageSource::Local(path) => ImageReader::open(path)
-            .ok()?
-            .with_guessed_format()
-            .ok()?
-            .decode()
-            .ok(),
+    load_image(source, remote_client, false).map(|(image, _)| image)
+}
+
+/// Decode an image. With `svg_text_as_labels`, SVG text is returned as labels and left out
+/// of the raster so text mode can draw it with real terminal characters.
+fn load_image(
+    source: &ResolvedImageSource,
+    remote_client: Option<&reqwest::blocking::Client>,
+    svg_text_as_labels: bool,
+) -> Option<(image::DynamicImage, Vec<TextLabel>)> {
+    let (bytes, is_svg) = match source {
+        ResolvedImageSource::Local(path) => (std::fs::read(path).ok()?, path_looks_like_svg(path)),
         ResolvedImageSource::Remote(url) => {
             let client = remote_client?;
             let response = client.get(url).send().ok()?.error_for_status().ok()?;
-            let bytes = response.bytes().ok()?;
-            image::load_from_memory(&bytes).ok()
+            let is_svg_content_type = response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.contains("svg"));
+            let bytes = response.bytes().ok()?.to_vec();
+            let is_svg = is_svg_content_type || bytes_look_like_svg(&bytes);
+            (bytes, is_svg)
+        }
+    };
+    if !is_svg {
+        return image::load_from_memory(&bytes)
+            .ok()
+            .map(|image| (image, Vec::new()));
+    }
+    if svg_text_as_labels {
+        let labels = parse_svg(&bytes)
+            .map(|tree| svg_text_labels(&tree))
+            .unwrap_or_default();
+        if !labels.is_empty() {
+            if let Some(image) =
+                parse_svg_without_text(&bytes).and_then(|tree| rasterize_svg_tree(&tree))
+            {
+                return Some((image, labels));
+            }
         }
     }
+    rasterize_svg(&bytes).map(|image| (image, Vec::new()))
+}
+
+/// Scale `image` down (never up) to fit inside `max_width` x `max_height`, preserving aspect.
+fn fit_image_within(
+    image: &image::DynamicImage,
+    max_width: u32,
+    max_height: u32,
+) -> image::DynamicImage {
+    let (width, height) = (image.width().max(1), image.height().max(1));
+    if width <= max_width && height <= max_height {
+        return image.clone();
+    }
+    let scale =
+        (f64::from(max_width) / f64::from(width)).min(f64::from(max_height) / f64::from(height));
+    let target_width = ((f64::from(width) * scale).round() as u32).max(1);
+    let target_height = ((f64::from(height) * scale).round() as u32).max(1);
+    image.resize_exact(
+        target_width,
+        target_height,
+        image::imageops::FilterType::Lanczos3,
+    )
+}
+
+/// Upper bound on the longest edge of a rasterized SVG, in pixels.
+const MAX_SVG_RASTER_EDGE: f32 = 2400.0;
+/// Scale factor applied to the SVG's intrinsic size for crisper terminal output.
+const SVG_RASTER_SCALE: f32 = 2.0;
+
+fn path_looks_like_svg(path: &Path) -> bool {
+    let has_svg_extension = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("svg") || ext.eq_ignore_ascii_case("svgz"));
+    has_svg_extension || std::fs::read(path).is_ok_and(|bytes| bytes_look_like_svg(&bytes))
+}
+
+fn bytes_look_like_svg(bytes: &[u8]) -> bool {
+    // gzip data (svgz) is only recognized by extension; otherwise look for an <svg element.
+    if bytes.starts_with(&[0x1f, 0x8b]) {
+        return false;
+    }
+    let head = &bytes[..bytes.len().min(4096)];
+    let text = String::from_utf8_lossy(head);
+    let trimmed = text.trim_start_matches('\u{feff}').trim_start();
+    (trimmed.starts_with('<')) && text.contains("<svg")
+}
+
+fn svg_fontdb() -> std::sync::Arc<resvg::usvg::fontdb::Database> {
+    static FONTDB: std::sync::OnceLock<std::sync::Arc<resvg::usvg::fontdb::Database>> =
+        std::sync::OnceLock::new();
+    FONTDB
+        .get_or_init(|| {
+            let mut db = resvg::usvg::fontdb::Database::new();
+            db.load_system_fonts();
+            std::sync::Arc::new(db)
+        })
+        .clone()
+}
+
+fn parse_svg(bytes: &[u8]) -> Option<resvg::usvg::Tree> {
+    let options = resvg::usvg::Options {
+        fontdb: svg_fontdb(),
+        ..Default::default()
+    };
+    resvg::usvg::Tree::from_data(bytes, &options).ok()
+}
+
+/// Pixel size (and scale factor) an SVG is rasterized at; shared by probing and loading
+/// so the reserved layout height does not change once the image arrives.
+fn svg_raster_size(tree: &resvg::usvg::Tree) -> (u32, u32, f32) {
+    let size = tree.size();
+    let longest = size.width().max(size.height()).max(1.0);
+    let scale = SVG_RASTER_SCALE.min(MAX_SVG_RASTER_EDGE / longest);
+    let width = (size.width() * scale).ceil().max(1.0) as u32;
+    let height = (size.height() * scale).ceil().max(1.0) as u32;
+    (width, height, scale)
+}
+
+/// Parse with no fonts available, which makes usvg drop text nodes entirely.
+fn parse_svg_without_text(bytes: &[u8]) -> Option<resvg::usvg::Tree> {
+    let options = resvg::usvg::Options {
+        fontdb: std::sync::Arc::new(resvg::usvg::fontdb::Database::new()),
+        ..Default::default()
+    };
+    resvg::usvg::Tree::from_data(bytes, &options).ok()
+}
+
+/// Collect every text chunk (one per positioned line) with its anchor point, colour and weight.
+fn svg_text_labels(tree: &resvg::usvg::Tree) -> Vec<TextLabel> {
+    use resvg::usvg::{Node, Paint, TextAnchor};
+
+    fn walk(group: &resvg::usvg::Group, size: (f32, f32), labels: &mut Vec<TextLabel>) {
+        for node in group.children() {
+            match node {
+                Node::Group(child) => walk(child, size, labels),
+                Node::Text(text) => {
+                    let transform = text.abs_transform();
+                    let bbox = text.abs_bounding_box();
+                    for chunk in text.chunks() {
+                        let content = chunk.text().trim();
+                        let Some(span) = chunk.spans().first() else {
+                            continue;
+                        };
+                        if content.is_empty() || !span.is_visible() {
+                            continue;
+                        }
+                        let color = match span.fill().map(|fill| fill.paint()) {
+                            Some(Paint::Color(c)) => [c.red, c.green, c.blue],
+                            _ => [0, 0, 0],
+                        };
+                        let mut point = resvg::tiny_skia::Point::from_xy(
+                            chunk.x().unwrap_or(0.0),
+                            chunk.y().unwrap_or(0.0),
+                        );
+                        transform.map_points(std::slice::from_mut(&mut point));
+                        if chunk.x().is_none() {
+                            point.x = bbox.left();
+                        }
+                        if chunk.y().is_none() {
+                            point.y = bbox.bottom();
+                        }
+                        // Baseline to visual centre of lowercase/caps text.
+                        let font_size =
+                            span.font_size().get() * transform.sy.abs().max(f32::EPSILON);
+                        let center_y = point.y - font_size * 0.35;
+                        labels.push(TextLabel {
+                            x: point.x / size.0,
+                            y: center_y / size.1,
+                            anchor: match chunk.anchor() {
+                                TextAnchor::Start => LabelAnchor::Start,
+                                TextAnchor::Middle => LabelAnchor::Middle,
+                                TextAnchor::End => LabelAnchor::End,
+                            },
+                            text: content.to_string(),
+                            color,
+                            bold: span.font().weight() >= 600,
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let size = tree.size();
+    let mut labels = Vec::new();
+    walk(
+        tree.root(),
+        (size.width().max(1.0), size.height().max(1.0)),
+        &mut labels,
+    );
+    labels
+}
+
+fn rasterize_svg(bytes: &[u8]) -> Option<image::DynamicImage> {
+    rasterize_svg_tree(&parse_svg(bytes)?)
+}
+
+fn rasterize_svg_tree(tree: &resvg::usvg::Tree) -> Option<image::DynamicImage> {
+    let (width, height, scale) = svg_raster_size(tree);
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(width, height)?;
+    resvg::render(
+        tree,
+        resvg::tiny_skia::Transform::from_scale(scale, scale),
+        &mut pixmap.as_mut(),
+    );
+    // tiny-skia stores premultiplied RGBA; convert to straight alpha for `image`.
+    let mut data = pixmap.take();
+    for px in data.chunks_exact_mut(4) {
+        let alpha = px[3];
+        if alpha != 0 && alpha != 255 {
+            for channel in &mut px[..3] {
+                *channel =
+                    ((*channel as u32 * 255 + alpha as u32 / 2) / alpha as u32).min(255) as u8;
+            }
+        }
+    }
+    image::RgbaImage::from_raw(width, height, data).map(image::DynamicImage::ImageRgba8)
 }
 
 fn resolve_image_source(markdown_path: &Path, src: &str) -> Option<ResolvedImageSource> {
@@ -2253,6 +2738,8 @@ mod tests {
             image_resize_tx,
             image_resize_rx,
             virtual_row_count_cache: BTreeMap::new(),
+            image_max_rows: 18,
+            text_image_mode: None,
             highlighted_lines_cache: None,
         }
     }
@@ -2326,6 +2813,11 @@ mod tests {
             has_encoded_state: false,
             pixel_size: None,
             hinted_pixel_size: Some((160, 160)),
+            source_image: None,
+            fitted_for: None,
+            generation: 0,
+            cell_art: None,
+            text_labels: Vec::new(),
             load_state: ImageLoadState::Loaded,
         }];
         app.image_index_by_line = BTreeMap::from([(8usize, 0usize)]);
@@ -2460,6 +2952,22 @@ mod tests {
     }
 
     #[test]
+    fn svg_images_are_rasterized() {
+        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="120" height="60" viewBox="0 0 120 60"><rect width="120" height="60" fill="#ff0000"/></svg>"##;
+        for name in ["svg", "data"] {
+            let path = std::env::temp_dir().join(format!("mdvi-svg-{}.{name}", std::process::id()));
+            std::fs::write(&path, svg).unwrap();
+            let dimensions = probe_local_image_dimensions(&path);
+            let loaded = load_dynamic_image(&ResolvedImageSource::Local(path.clone()), None);
+            std::fs::remove_file(path).unwrap();
+            let loaded = loaded.expect("SVG should rasterize").to_rgba8();
+            assert_eq!(dimensions, Some((loaded.width(), loaded.height())));
+            assert_eq!(loaded.width() * 60, loaded.height() * 120);
+            assert_eq!(loaded.get_pixel(1, 1).0, [255, 0, 0, 255]);
+        }
+    }
+
+    #[test]
     fn scroll_clamps_to_bottom() {
         let mut app = test_app(100);
         app.scroll_down(1000, 20, 80);
@@ -2508,6 +3016,11 @@ mod tests {
             has_encoded_state: false,
             pixel_size: None,
             hinted_pixel_size: None,
+            source_image: None,
+            fitted_for: None,
+            generation: 0,
+            cell_art: None,
+            text_labels: Vec::new(),
             load_state: ImageLoadState::Loading,
         }];
         app.image_index_by_line = BTreeMap::from([(2usize, 0usize)]);
@@ -2520,9 +3033,10 @@ mod tests {
         result_tx
             .send(ImageLoadResult {
                 image_index: 0,
-                payload: ImageLoadResultPayload::LoadedImage(Some(image::DynamicImage::new_rgb8(
-                    320, 200,
-                ))),
+                payload: ImageLoadResultPayload::LoadedImage(
+                    Some(image::DynamicImage::new_rgb8(320, 200)),
+                    Vec::new(),
+                ),
             })
             .expect("image result should enqueue");
 
@@ -2549,6 +3063,11 @@ mod tests {
                 has_encoded_state: false,
                 pixel_size: None,
                 hinted_pixel_size: None,
+                source_image: None,
+                fitted_for: None,
+                generation: 0,
+                cell_art: None,
+                text_labels: Vec::new(),
                 load_state: ImageLoadState::NotRequested,
             },
             InlineImage {
@@ -2565,6 +3084,11 @@ mod tests {
                 has_encoded_state: false,
                 pixel_size: None,
                 hinted_pixel_size: None,
+                source_image: None,
+                fitted_for: None,
+                generation: 0,
+                cell_art: None,
+                text_labels: Vec::new(),
                 load_state: ImageLoadState::NotRequested,
             },
         ];
@@ -2580,7 +3104,7 @@ mod tests {
             ImageLoadJob::ProbeLocalDimensions(path) => {
                 assert_eq!(path, PathBuf::from("/tmp/image-a.png"));
             }
-            ImageLoadJob::LoadImage(_) => panic!("expected dimension probe request"),
+            ImageLoadJob::LoadImage(..) => panic!("expected dimension probe request"),
         }
         assert!(request_rx.try_recv().is_err());
     }
@@ -2604,6 +3128,11 @@ mod tests {
             has_encoded_state: false,
             pixel_size: None,
             hinted_pixel_size: None,
+            source_image: None,
+            fitted_for: None,
+            generation: 0,
+            cell_art: None,
+            text_labels: Vec::new(),
             load_state: ImageLoadState::NotRequested,
         }];
         app.image_loader_tx = image_loader_tx;
@@ -2643,6 +3172,11 @@ mod tests {
                 has_encoded_state: false,
                 pixel_size: None,
                 hinted_pixel_size: None,
+                source_image: None,
+                fitted_for: None,
+                generation: 0,
+                cell_art: None,
+                text_labels: Vec::new(),
                 load_state: ImageLoadState::Loading,
             })
             .collect();
@@ -2653,9 +3187,10 @@ mod tests {
             result_tx
                 .send(ImageLoadResult {
                     image_index,
-                    payload: ImageLoadResultPayload::LoadedImage(Some(
-                        image::DynamicImage::new_rgb8(320, 200),
-                    )),
+                    payload: ImageLoadResultPayload::LoadedImage(
+                        Some(image::DynamicImage::new_rgb8(320, 200)),
+                        Vec::new(),
+                    ),
                 })
                 .expect("image result should enqueue");
         }
@@ -2693,6 +3228,11 @@ mod tests {
             has_encoded_state: false,
             pixel_size: Some((320, 200)),
             hinted_pixel_size: None,
+            source_image: None,
+            fitted_for: None,
+            generation: 0,
+            cell_art: None,
+            text_labels: Vec::new(),
             load_state: ImageLoadState::Loaded,
         }];
         app.image_resize_tx = image_resize_tx;
@@ -2713,6 +3253,108 @@ mod tests {
             .try_recv()
             .expect("resize request should be queued");
         assert_eq!(request.image_index, 0);
+    }
+
+    fn loaded_test_image(app: &App, width: u32, height: u32) -> InlineImage {
+        let source = image::DynamicImage::new_rgb8(width, height);
+        InlineImage {
+            line_index: 0,
+            source: Some(ResolvedImageSource::Remote(
+                "https://example.com/image.png".to_string(),
+            )),
+            state: Some(app.picker.new_resize_protocol(source.clone())),
+            scratch_state: None,
+            active_variant: None,
+            cached_variants: BTreeMap::new(),
+            resize_pending: false,
+            pending_variant: None,
+            has_encoded_state: false,
+            pixel_size: Some((width, height)),
+            hinted_pixel_size: None,
+            source_image: Some(source),
+            fitted_for: None,
+            generation: 1,
+            cell_art: None,
+            text_labels: Vec::new(),
+            load_state: ImageLoadState::Loaded,
+        }
+    }
+
+    #[test]
+    fn window_pixel_report_is_parsed_from_terminal_response() {
+        let response = b"\x1b[4;918;1904t\x1b[?61;1;21;22;28c";
+        assert_eq!(parse_window_pixel_report(response), Some((918, 1904)));
+        assert!(parse_device_attributes_end(response));
+        assert!(!parse_device_attributes_end(b"\x1b[4;918;1904t"));
+        assert_eq!(parse_window_pixel_report(b"\x1b[?62c"), None);
+    }
+
+    #[test]
+    fn fit_image_within_downscales_preserving_aspect_and_never_upscales() {
+        let big = image::DynamicImage::new_rgb8(2240, 1500);
+        let fitted = fit_image_within(&big, 800, 2000);
+        assert_eq!((fitted.width(), fitted.height()), (800, 536));
+        let small = image::DynamicImage::new_rgb8(100, 50);
+        let fitted = fit_image_within(&small, 800, 600);
+        assert_eq!((fitted.width(), fitted.height()), (100, 50));
+    }
+
+    #[test]
+    fn images_are_prefitted_to_their_layout_box() {
+        let mut app = test_app(1);
+        app.images = vec![loaded_test_image(&app, 2240, 1500)];
+        // test picker font is 8x16: 40 cols x 10 rows = 320x160 px box.
+        app.fit_image_to_layout(0, 40, 10);
+        let image = &app.images[0];
+        assert_eq!(image.fitted_for, Some((40, 10)));
+        assert_eq!(image.generation, 2);
+        assert!(image.scratch_state.is_some());
+        let target = image
+            .state
+            .as_ref()
+            .unwrap()
+            .size_for(Resize::Crop(None), Rect::new(0, 0, 200, 200));
+        // 239x160 px rounds up to 30x10 cells; cropping can no longer zoom in.
+        assert_eq!((target.width, target.height), (30, 10));
+    }
+
+    #[test]
+    fn stale_resize_results_are_discarded_after_refit() {
+        let (image_resize_tx, _resize_request_rx) = mpsc::channel::<ImageResizeRequest>();
+        let (resize_result_tx, image_resize_rx) = mpsc::channel::<ImageResizeResult>();
+        let mut app = test_app(1);
+        app.image_resize_tx = image_resize_tx;
+        app.image_resize_rx = image_resize_rx;
+        app.images = vec![loaded_test_image(&app, 640, 400)];
+        app.fit_image_to_layout(0, 40, 10);
+        let stale_protocol = app
+            .picker
+            .new_resize_protocol(image::DynamicImage::new_rgb8(640, 400));
+        resize_result_tx
+            .send(ImageResizeResult {
+                image_index: 0,
+                variant: ImageResizeVariant {
+                    width: 40,
+                    height: 10,
+                    mode: ImageResizeMode::Fit,
+                },
+                protocol: stale_protocol,
+                generation: 1,
+            })
+            .unwrap();
+        assert!(!app.drain_image_resize_results());
+        assert_eq!(app.images[0].active_variant, None);
+    }
+
+    #[test]
+    fn image_row_cap_tracks_viewport_height() {
+        let mut app = test_app(1);
+        app.set_viewport_height(60);
+        assert_eq!(app.image_max_rows, 48);
+        app.set_viewport_height(20);
+        assert_eq!(app.image_max_rows, 18);
+        app.set_viewport_height(10);
+        assert_eq!(app.image_max_rows, 10);
     }
 
     #[test]
@@ -2738,6 +3380,11 @@ mod tests {
             has_encoded_state: true,
             pixel_size: Some((320, 200)),
             hinted_pixel_size: None,
+            source_image: None,
+            fitted_for: None,
+            generation: 0,
+            cell_art: None,
+            text_labels: Vec::new(),
             load_state: ImageLoadState::Loaded,
         }];
         app.image_resize_tx = image_resize_tx;
@@ -2746,6 +3393,7 @@ mod tests {
         resize_result_tx
             .send(ImageResizeResult {
                 image_index: 0,
+                generation: 0,
                 variant: ImageResizeVariant {
                     width: 40,
                     height: 10,
@@ -2795,6 +3443,11 @@ mod tests {
             has_encoded_state: false,
             pixel_size: Some((320, 200)),
             hinted_pixel_size: None,
+            source_image: None,
+            fitted_for: None,
+            generation: 0,
+            cell_art: None,
+            text_labels: Vec::new(),
             load_state: ImageLoadState::Loaded,
         }];
         app.image_resize_tx = image_resize_tx;
@@ -2841,6 +3494,11 @@ mod tests {
             has_encoded_state: true,
             pixel_size: Some((320, 200)),
             hinted_pixel_size: None,
+            source_image: None,
+            fitted_for: None,
+            generation: 0,
+            cell_art: None,
+            text_labels: Vec::new(),
             load_state: ImageLoadState::Loaded,
         }];
         app.image_resize_tx = image_resize_tx;
@@ -2849,6 +3507,7 @@ mod tests {
         resize_result_tx
             .send(ImageResizeResult {
                 image_index: 0,
+                generation: 0,
                 variant: pending_variant,
                 protocol: app
                     .picker
@@ -3301,6 +3960,11 @@ mod tests {
             has_encoded_state: false,
             pixel_size: None,
             hinted_pixel_size: Some((1708, 1040)),
+            source_image: None,
+            fitted_for: None,
+            generation: 0,
+            cell_art: None,
+            text_labels: Vec::new(),
             load_state: ImageLoadState::NotRequested,
         };
 
@@ -3324,6 +3988,11 @@ mod tests {
             has_encoded_state: false,
             pixel_size: None,
             hinted_pixel_size: None,
+            source_image: None,
+            fitted_for: None,
+            generation: 0,
+            cell_art: None,
+            text_labels: Vec::new(),
             load_state: ImageLoadState::Failed,
         };
 
