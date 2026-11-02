@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- Lightweight HTML renderer for HTML embedded in markdown. Common block and inline tags render
+  like their markdown equivalents, `align="center|right"` and `<center>` align text, entities are
+  decoded, and comments, `<script>` and `<style>` are hidden instead of shown as raw markup.
+
 ## [0.6.9] - 2026-11-02
 
 ### Added

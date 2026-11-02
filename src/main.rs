@@ -1,5 +1,6 @@
 mod app;
 mod cellart;
+mod html;
 mod layout;
 mod renderer;
 

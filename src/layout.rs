@@ -1,6 +1,9 @@
 use std::ops::Range;
 
-use ratatui::text::{Line, Text};
+use ratatui::{
+    layout::Alignment,
+    text::{Line, Text},
+};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
@@ -56,7 +59,6 @@ pub fn wrap_line(line: &Line<'static>, width: u16) -> Vec<Line<'static>> {
         .into_iter()
         .map(|range| {
             let mut row = Line::default().style(line.style);
-            row.alignment = line.alignment;
             let mut offset = 0;
             for span in &line.spans {
                 let end = offset + span.content.len();
@@ -69,9 +71,36 @@ pub fn wrap_line(line: &Line<'static>, width: u16) -> Vec<Line<'static>> {
                 }
                 offset = end;
             }
-            row
+            align_row(row, line.alignment, usize::from(width))
         })
         .collect()
+}
+
+/// Bake alignment into leading padding so cursor and selection columns, which are
+/// measured from the left edge of each row, stay accurate.
+fn align_row(mut row: Line<'static>, alignment: Option<Alignment>, width: usize) -> Line<'static> {
+    let fraction = match alignment {
+        Some(Alignment::Center) => 2,
+        Some(Alignment::Right) => 1,
+        _ => return row,
+    };
+    while let Some(last) = row.spans.last_mut() {
+        let trimmed = last.content.trim_end();
+        if trimmed.is_empty() {
+            row.spans.pop();
+        } else {
+            if trimmed.len() != last.content.len() {
+                last.content = trimmed.to_string().into();
+            }
+            break;
+        }
+    }
+    let padding = width.saturating_sub(row.width()) / fraction;
+    if padding > 0 && !row.spans.is_empty() {
+        row.spans
+            .insert(0, ratatui::text::Span::raw(" ".repeat(padding)));
+    }
+    row
 }
 
 /// Crop by terminal cells, padding partial wide glyphs to keep columns aligned.
@@ -217,5 +246,22 @@ mod tests {
         terminal
             .backend()
             .assert_buffer_lines(["row 65536 ", "row 65537 "]);
+    }
+
+    #[test]
+    fn aligned_lines_are_padded_without_trailing_space() {
+        let centered = Line::from("one two three").alignment(Alignment::Center);
+        let rows: Vec<String> = wrap_line(&centered, 9)
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(rows, [" one two", "  three"]);
+        let right = Line::from("ab").alignment(Alignment::Right);
+        assert_eq!(wrap_line(&right, 5)[0].to_string(), "   ab");
+        assert!(
+            wrap_line(&Line::default().alignment(Alignment::Center), 9)[0]
+                .spans
+                .is_empty()
+        );
     }
 }

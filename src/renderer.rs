@@ -1,10 +1,11 @@
+use crate::html::{HtmlTranslator, RenderEvent};
 use anyhow::{Context, Result};
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use ratatui::{
+    layout::Alignment as LineAlignment,
     style::{Color, Modifier, Style},
     text::{Line, Span},
 };
-use regex::Regex;
 use std::sync::OnceLock;
 use syntect::{
     easy::HighlightLines,
@@ -39,13 +40,6 @@ struct CodeHighlightAssets {
     theme: Theme,
 }
 
-#[derive(Debug, Clone)]
-struct HtmlImageTag {
-    src: String,
-    alt: String,
-    hinted_pixel_size: Option<(u32, u32)>,
-}
-
 /// Keep cells separate until every column's display width is known.
 struct TableLayout {
     alignments: Vec<Alignment>,
@@ -67,7 +61,14 @@ impl TableLayout {
     }
 
     fn render(self) -> Vec<Line<'static>> {
-        let widths: Vec<usize> = (0..self.alignments.len())
+        let columns = self
+            .rows
+            .iter()
+            .map(Vec::len)
+            .max()
+            .unwrap_or(0)
+            .max(self.alignments.len());
+        let widths: Vec<usize> = (0..columns)
             .map(|column| {
                 self.rows
                     .iter()
@@ -98,7 +99,12 @@ impl TableLayout {
             for (column, width) in widths.iter().enumerate() {
                 let cell = row.get(column).cloned().unwrap_or_default();
                 let padding = width.saturating_sub(cell.width());
-                let left = match self.alignments[column] {
+                let left = match self
+                    .alignments
+                    .get(column)
+                    .copied()
+                    .unwrap_or(Alignment::None)
+                {
                     Alignment::Right => padding,
                     Alignment::Center => padding / 2,
                     _ => 0,
@@ -225,338 +231,393 @@ pub fn render_markdown(input: &str) -> Result<RenderedDoc> {
         }
     }
 
-    for event in parser {
-        if pending_image.is_some() {
-            match event {
-                Event::End(TagEnd::Image) => {
-                    let (src, alt_raw) = pending_image.take().expect("pending image exists");
-                    append_image_entry(&mut lines, &mut images, src, alt_raw, None, true);
-                }
-                Event::Text(text)
-                | Event::Code(text)
-                | Event::Html(text)
-                | Event::InlineHtml(text)
-                | Event::InlineMath(text)
-                | Event::DisplayMath(text) => {
-                    if let Some((_, alt)) = pending_image.as_mut() {
-                        alt.push_str(&text);
-                    }
-                }
-                Event::SoftBreak | Event::HardBreak => {
-                    if let Some((_, alt)) = pending_image.as_mut() {
-                        alt.push(' ');
-                    }
-                }
-                _ => {}
+    let mut html = HtmlTranslator::new();
+    let mut queue: Vec<RenderEvent<'_>> = Vec::new();
+    let mut align_starts: Vec<(usize, LineAlignment)> = Vec::new();
+
+    for md_event in parser.map(Some).chain(std::iter::once(None)) {
+        match md_event {
+            None => html.finish(&mut queue),
+            Some(event) if pending_image.is_some() => queue.push(RenderEvent::Md(event)),
+            // Block HTML never appears inside a markdown table; only inline HTML can.
+            Some(Event::Html(text)) => html.feed(&text, false, false, &mut queue),
+            Some(Event::InlineHtml(text)) => html.feed(&text, true, table.is_some(), &mut queue),
+            Some(Event::Start(Tag::HtmlBlock) | Event::End(TagEnd::HtmlBlock)) => {
+                html.block_boundary(&mut queue)
             }
-            continue;
+            Some(
+                event @ Event::End(
+                    TagEnd::Paragraph
+                    | TagEnd::Heading(_)
+                    | TagEnd::Item
+                    | TagEnd::TableCell
+                    | TagEnd::BlockQuote(_)
+                    | TagEnd::FootnoteDefinition,
+                ),
+            ) => {
+                html.close_inline(&mut queue);
+                queue.push(RenderEvent::Md(event));
+            }
+            Some(event) => queue.push(RenderEvent::Md(event)),
         }
 
-        match event {
-            Event::Start(tag) => match tag {
-                Tag::Paragraph => {}
-                Tag::Heading { level, .. } => {
-                    blank_line(&mut lines, &mut current_spans);
-                    let style = match level {
-                        HeadingLevel::H1 => {
-                            Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
-                        }
-                        HeadingLevel::H2 => Style::default().add_modifier(Modifier::BOLD),
-                        HeadingLevel::H3 | HeadingLevel::H4 => {
-                            Style::default().add_modifier(Modifier::BOLD | Modifier::ITALIC)
-                        }
-                        HeadingLevel::H5 | HeadingLevel::H6 => {
-                            Style::default().add_modifier(Modifier::ITALIC)
-                        }
-                    };
-                    style_stack.push(style);
+        for event in queue.drain(..) {
+            let event = match event {
+                RenderEvent::Md(event) => event,
+                RenderEvent::BlockBreak => {
+                    if !current_spans.is_empty() {
+                        push_line(&mut lines, &mut current_spans);
+                    }
+                    continue;
                 }
-                Tag::BlockQuote(_) => {
+                RenderEvent::BlockEnd => {
                     blank_line(&mut lines, &mut current_spans);
-                    blockquote_starts.push(lines.len());
+                    continue;
                 }
-                Tag::CodeBlock(kind) => {
-                    blank_line(&mut lines, &mut current_spans);
-                    in_code_block = true;
-                    code_block_start = lines.len();
-                    let code_block_info = match kind {
-                        CodeBlockKind::Fenced(lang) => {
-                            let lang = lang.trim();
-                            if lang.is_empty() {
-                                None
-                            } else {
-                                Some(lang.to_string())
+                RenderEvent::AlignStart(alignment) => {
+                    if !current_spans.is_empty() {
+                        push_line(&mut lines, &mut current_spans);
+                    }
+                    align_starts.push((lines.len(), alignment));
+                    continue;
+                }
+                RenderEvent::AlignEnd => {
+                    if !current_spans.is_empty() {
+                        push_line(&mut lines, &mut current_spans);
+                    }
+                    if let Some((start, alignment)) = align_starts.pop() {
+                        let laid_out = |index: usize| {
+                            code_blocks
+                                .iter()
+                                .chain(tables.iter())
+                                .any(|range: &std::ops::Range<usize>| range.contains(&index))
+                                || images.iter().any(|image| image.line_index == index)
+                        };
+                        for (index, line) in lines.iter_mut().enumerate().skip(start) {
+                            if line.alignment.is_none() && !laid_out(index) {
+                                line.alignment = Some(alignment);
                             }
                         }
-                        CodeBlockKind::Indented => None,
-                    };
-                    let code_block_language = code_block_info
-                        .as_deref()
-                        .and_then(extract_code_block_language_token)
-                        .map(ToString::to_string);
-                    active_code_highlighter = new_code_highlighter(code_block_language.as_deref());
+                    }
+                    continue;
+                }
+                RenderEvent::StyleStart(modifier) => {
+                    let base = *style_stack.last().unwrap_or(&Style::default());
+                    style_stack.push(base.add_modifier(modifier));
+                    continue;
+                }
+                RenderEvent::StyleEnd => {
+                    if style_stack.len() > 1 {
+                        style_stack.pop();
+                    }
+                    continue;
+                }
+                RenderEvent::Image {
+                    src,
+                    alt,
+                    hinted_pixel_size,
+                } => {
+                    blank_line(&mut lines, &mut current_spans);
+                    append_image_entry(&mut lines, &mut images, src, alt, hinted_pixel_size, true);
+                    continue;
+                }
+            };
+            if pending_image.is_some() {
+                match event {
+                    Event::End(TagEnd::Image) => {
+                        let (src, alt_raw) = pending_image.take().expect("pending image exists");
+                        append_image_entry(&mut lines, &mut images, src, alt_raw, None, true);
+                    }
+                    Event::Text(text)
+                    | Event::Code(text)
+                    | Event::Html(text)
+                    | Event::InlineHtml(text)
+                    | Event::InlineMath(text)
+                    | Event::DisplayMath(text) => {
+                        if let Some((_, alt)) = pending_image.as_mut() {
+                            alt.push_str(&text);
+                        }
+                    }
+                    Event::SoftBreak | Event::HardBreak => {
+                        if let Some((_, alt)) = pending_image.as_mut() {
+                            alt.push(' ');
+                        }
+                    }
+                    _ => {}
+                }
+                continue;
+            }
 
-                    let header = match &code_block_info {
-                        Some(lang) => format!("```{lang}"),
-                        None => "```".to_string(),
-                    };
-                    lines.push(Line::from(Span::styled(
-                        header,
-                        Style::default().add_modifier(Modifier::DIM),
-                    )));
-                }
-                Tag::List(start) => {
-                    let kind = match start {
-                        Some(v) => ListKind::Ordered(v),
-                        None => ListKind::Unordered,
-                    };
-                    list_stack.push(kind);
-                }
-                Tag::Item => {
-                    if !current_spans.is_empty() {
-                        push_line(&mut lines, &mut current_spans);
+            match event {
+                Event::Start(tag) => match tag {
+                    Tag::Paragraph => {}
+                    Tag::Heading { level, .. } => {
+                        blank_line(&mut lines, &mut current_spans);
+                        let style = match level {
+                            HeadingLevel::H1 => {
+                                Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+                            }
+                            HeadingLevel::H2 => Style::default().add_modifier(Modifier::BOLD),
+                            HeadingLevel::H3 | HeadingLevel::H4 => {
+                                Style::default().add_modifier(Modifier::BOLD | Modifier::ITALIC)
+                            }
+                            HeadingLevel::H5 | HeadingLevel::H6 => {
+                                Style::default().add_modifier(Modifier::ITALIC)
+                            }
+                        };
+                        style_stack.push(style);
                     }
-                    let indent = indent_for_lists(&list_stack);
-                    let marker = match list_stack.last_mut() {
-                        Some(ListKind::Ordered(n)) => {
-                            let m = format!("{n}. ");
-                            *n += 1;
-                            m
+                    Tag::BlockQuote(_) => {
+                        blank_line(&mut lines, &mut current_spans);
+                        blockquote_starts.push(lines.len());
+                    }
+                    Tag::CodeBlock(kind) => {
+                        blank_line(&mut lines, &mut current_spans);
+                        in_code_block = true;
+                        code_block_start = lines.len();
+                        let code_block_info = match kind {
+                            CodeBlockKind::Fenced(lang) => {
+                                let lang = lang.trim();
+                                if lang.is_empty() {
+                                    None
+                                } else {
+                                    Some(lang.to_string())
+                                }
+                            }
+                            CodeBlockKind::Indented => None,
+                        };
+                        let code_block_language = code_block_info
+                            .as_deref()
+                            .and_then(extract_code_block_language_token)
+                            .map(ToString::to_string);
+                        active_code_highlighter =
+                            new_code_highlighter(code_block_language.as_deref());
+
+                        let header = match &code_block_info {
+                            Some(lang) => format!("```{lang}"),
+                            None => "```".to_string(),
+                        };
+                        lines.push(Line::from(Span::styled(
+                            header,
+                            Style::default().add_modifier(Modifier::DIM),
+                        )));
+                    }
+                    Tag::List(start) => {
+                        let kind = match start {
+                            Some(v) => ListKind::Ordered(v),
+                            None => ListKind::Unordered,
+                        };
+                        list_stack.push(kind);
+                    }
+                    Tag::Item => {
+                        if !current_spans.is_empty() {
+                            push_line(&mut lines, &mut current_spans);
                         }
-                        Some(ListKind::Unordered) | None => "• ".to_string(),
-                    };
-                    current_spans.push(Span::raw(format!("{indent}{marker}")));
-                }
-                Tag::Emphasis => {
-                    let base = *style_stack.last().unwrap_or(&Style::default());
-                    style_stack.push(base.add_modifier(Modifier::ITALIC));
-                }
-                Tag::Strong => {
-                    let base = *style_stack.last().unwrap_or(&Style::default());
-                    style_stack.push(base.add_modifier(Modifier::BOLD));
-                }
-                Tag::Strikethrough => {
-                    let base = *style_stack.last().unwrap_or(&Style::default());
-                    style_stack.push(base.add_modifier(Modifier::CROSSED_OUT));
-                }
-                Tag::Link { dest_url, .. } => {
-                    let base = *style_stack.last().unwrap_or(&Style::default());
-                    style_stack.push(base.add_modifier(Modifier::UNDERLINED));
-                    pending_link = Some((dest_url.to_string(), current_spans.len()));
-                }
-                Tag::Image { dest_url, .. } => {
-                    blank_line(&mut lines, &mut current_spans);
-                    pending_image = Some((dest_url.to_string(), String::new()));
-                }
-                Tag::Table(alignments) => {
-                    blank_line(&mut lines, &mut current_spans);
-                    table = Some(TableLayout::new(alignments));
-                }
-                Tag::TableHead => {}
-                Tag::TableRow => {}
-                Tag::TableCell => {}
-                Tag::FootnoteDefinition(name) => {
-                    blank_line(&mut lines, &mut current_spans);
-                    current_spans.push(Span::styled(
-                        format!("[^{name}] "),
-                        Style::default().add_modifier(Modifier::DIM),
-                    ));
-                }
-                _ => {}
-            },
-            Event::End(tag) => match tag {
-                TagEnd::Paragraph => {
-                    push_line(&mut lines, &mut current_spans);
-                    lines.push(Line::default());
-                }
-                TagEnd::Heading(_) => {
-                    push_line(&mut lines, &mut current_spans);
-                    style_stack.pop();
-                    lines.push(Line::default());
-                }
-                TagEnd::BlockQuote(_) => {
-                    if !current_spans.is_empty() {
-                        push_line(&mut lines, &mut current_spans);
+                        let indent = indent_for_lists(&list_stack);
+                        let marker = match list_stack.last_mut() {
+                            Some(ListKind::Ordered(n)) => {
+                                let m = format!("{n}. ");
+                                *n += 1;
+                                m
+                            }
+                            Some(ListKind::Unordered) | None => "• ".to_string(),
+                        };
+                        current_spans.push(Span::raw(format!("{indent}{marker}")));
                     }
-                    if let Some(start) = blockquote_starts.pop() {
-                        for line in &mut lines[start..] {
-                            line.spans.insert(
-                                0,
-                                Span::styled("│ ", Style::default().add_modifier(Modifier::DIM)),
-                            );
+                    Tag::Emphasis => {
+                        let base = *style_stack.last().unwrap_or(&Style::default());
+                        style_stack.push(base.add_modifier(Modifier::ITALIC));
+                    }
+                    Tag::Strong => {
+                        let base = *style_stack.last().unwrap_or(&Style::default());
+                        style_stack.push(base.add_modifier(Modifier::BOLD));
+                    }
+                    Tag::Strikethrough => {
+                        let base = *style_stack.last().unwrap_or(&Style::default());
+                        style_stack.push(base.add_modifier(Modifier::CROSSED_OUT));
+                    }
+                    Tag::Link { dest_url, .. } => {
+                        let base = *style_stack.last().unwrap_or(&Style::default());
+                        style_stack.push(base.add_modifier(Modifier::UNDERLINED));
+                        pending_link = Some((dest_url.to_string(), current_spans.len()));
+                    }
+                    Tag::Image { dest_url, .. } => {
+                        blank_line(&mut lines, &mut current_spans);
+                        pending_image = Some((dest_url.to_string(), String::new()));
+                    }
+                    Tag::Table(alignments) => {
+                        blank_line(&mut lines, &mut current_spans);
+                        table = Some(TableLayout::new(alignments));
+                    }
+                    Tag::TableHead => {}
+                    Tag::TableRow => {}
+                    Tag::TableCell => {}
+                    Tag::FootnoteDefinition(name) => {
+                        blank_line(&mut lines, &mut current_spans);
+                        current_spans.push(Span::styled(
+                            format!("[^{name}] "),
+                            Style::default().add_modifier(Modifier::DIM),
+                        ));
+                    }
+                    _ => {}
+                },
+                Event::End(tag) => match tag {
+                    TagEnd::Paragraph => {
+                        push_line(&mut lines, &mut current_spans);
+                        lines.push(Line::default());
+                    }
+                    TagEnd::Heading(_) => {
+                        push_line(&mut lines, &mut current_spans);
+                        style_stack.pop();
+                        lines.push(Line::default());
+                    }
+                    TagEnd::BlockQuote(_) => {
+                        if !current_spans.is_empty() {
+                            push_line(&mut lines, &mut current_spans);
                         }
-                    }
-                    blank_line(&mut lines, &mut current_spans);
-                }
-                TagEnd::CodeBlock => {
-                    append_code_block_text(
-                        &code_text,
-                        &mut current_spans,
-                        &mut lines,
-                        &mut active_code_highlighter,
-                        Style::default(),
-                    );
-                    code_text.clear();
-                    if !current_spans.is_empty() {
-                        push_line(&mut lines, &mut current_spans);
-                    }
-                    lines.push(Line::from(Span::styled(
-                        "```".to_string(),
-                        Style::default().add_modifier(Modifier::DIM),
-                    )));
-                    lines.push(Line::default());
-                    code_blocks.push(code_block_start..lines.len() - 1);
-                    in_code_block = false;
-                    active_code_highlighter = None;
-                }
-                TagEnd::List(_) => {
-                    list_stack.pop();
-                    if list_stack.is_empty() {
+                        if let Some(start) = blockquote_starts.pop() {
+                            for line in &mut lines[start..] {
+                                line.spans.insert(
+                                    0,
+                                    Span::styled(
+                                        "│ ",
+                                        Style::default().add_modifier(Modifier::DIM),
+                                    ),
+                                );
+                            }
+                        }
                         blank_line(&mut lines, &mut current_spans);
                     }
+                    TagEnd::CodeBlock => {
+                        append_code_block_text(
+                            &code_text,
+                            &mut current_spans,
+                            &mut lines,
+                            &mut active_code_highlighter,
+                            Style::default(),
+                        );
+                        code_text.clear();
+                        if !current_spans.is_empty() {
+                            push_line(&mut lines, &mut current_spans);
+                        }
+                        lines.push(Line::from(Span::styled(
+                            "```".to_string(),
+                            Style::default().add_modifier(Modifier::DIM),
+                        )));
+                        lines.push(Line::default());
+                        code_blocks.push(code_block_start..lines.len() - 1);
+                        in_code_block = false;
+                        active_code_highlighter = None;
+                    }
+                    TagEnd::List(_) => {
+                        list_stack.pop();
+                        if list_stack.is_empty() {
+                            blank_line(&mut lines, &mut current_spans);
+                        }
+                    }
+                    TagEnd::Item => {
+                        if !current_spans.is_empty() {
+                            push_line(&mut lines, &mut current_spans);
+                        }
+                    }
+                    TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough => {
+                        style_stack.pop();
+                    }
+                    TagEnd::Link => {
+                        style_stack.pop();
+                        if let Some((link, start)) = pending_link.take() {
+                            let label: String = current_spans
+                                .get(start..)
+                                .unwrap_or_default()
+                                .iter()
+                                .map(|s| s.content.as_ref())
+                                .collect();
+                            if label != link {
+                                current_spans.push(Span::styled(
+                                    format!(" ({link})"),
+                                    Style::default().add_modifier(Modifier::DIM),
+                                ));
+                            }
+                        }
+                    }
+                    TagEnd::Image => {}
+                    TagEnd::Table => {
+                        if let Some(mut table) = table.take() {
+                            if !table.current_row.is_empty() {
+                                table.finish_row();
+                            }
+                            let start = lines.len();
+                            lines.extend(table.render());
+                            tables.push(start..lines.len());
+                        }
+                        blank_line(&mut lines, &mut current_spans);
+                    }
+                    TagEnd::TableHead | TagEnd::TableRow => {
+                        if let Some(table) = table.as_mut() {
+                            table.finish_row();
+                        }
+                    }
+                    TagEnd::TableCell => {
+                        if let Some(table) = table.as_mut() {
+                            table
+                                .current_row
+                                .push(Line::from(std::mem::take(&mut current_spans)));
+                        }
+                    }
+                    _ => {}
+                },
+                Event::Text(text) => {
+                    let base = *style_stack.last().unwrap_or(&Style::default());
+                    if in_code_block {
+                        code_text.push_str(&text);
+                    } else {
+                        current_spans.push(Span::styled(text.to_string(), base));
+                    }
                 }
-                TagEnd::Item => {
-                    if !current_spans.is_empty() {
+                Event::Code(text) => {
+                    let base = *style_stack.last().unwrap_or(&Style::default());
+                    current_spans.push(Span::styled(
+                        format!("`{text}`"),
+                        base.add_modifier(Modifier::BOLD),
+                    ));
+                }
+                Event::SoftBreak => {
+                    if soft_break_as_space {
+                        current_spans.push(Span::raw(" ".to_string()));
+                    } else {
                         push_line(&mut lines, &mut current_spans);
                     }
                 }
-                TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough => {
-                    style_stack.pop();
-                }
-                TagEnd::Link => {
-                    style_stack.pop();
-                    if let Some((link, start)) = pending_link.take() {
-                        let label: String = current_spans
-                            .get(start..)
-                            .unwrap_or_default()
-                            .iter()
-                            .map(|s| s.content.as_ref())
-                            .collect();
-                        if label != link {
-                            current_spans.push(Span::styled(
-                                format!(" ({link})"),
-                                Style::default().add_modifier(Modifier::DIM),
-                            ));
-                        }
-                    }
-                }
-                TagEnd::Image => {}
-                TagEnd::Table => {
-                    if let Some(table) = table.take() {
-                        let start = lines.len();
-                        lines.extend(table.render());
-                        tables.push(start..lines.len());
-                    }
-                    blank_line(&mut lines, &mut current_spans);
-                }
-                TagEnd::TableHead | TagEnd::TableRow => {
-                    if let Some(table) = table.as_mut() {
-                        table.finish_row();
-                    }
-                }
-                TagEnd::TableCell => {
-                    if let Some(table) = table.as_mut() {
-                        table
-                            .current_row
-                            .push(Line::from(std::mem::take(&mut current_spans)));
-                    }
-                }
-                _ => {}
-            },
-            Event::Text(text) => {
-                let base = *style_stack.last().unwrap_or(&Style::default());
-                if in_code_block {
-                    code_text.push_str(&text);
-                } else {
-                    current_spans.push(Span::styled(text.to_string(), base));
-                }
-            }
-            Event::Code(text) => {
-                let base = *style_stack.last().unwrap_or(&Style::default());
-                current_spans.push(Span::styled(
-                    format!("`{text}`"),
-                    base.add_modifier(Modifier::BOLD),
-                ));
-            }
-            Event::Html(text) => {
-                let html = text.to_string();
-                let html_images = extract_html_images(&html);
-                if html_images.is_empty() {
-                    current_spans.push(Span::styled(
-                        html,
-                        Style::default().add_modifier(Modifier::DIM),
-                    ));
-                } else {
-                    blank_line(&mut lines, &mut current_spans);
-                    for image_tag in html_images {
-                        append_image_entry(
-                            &mut lines,
-                            &mut images,
-                            image_tag.src,
-                            image_tag.alt,
-                            image_tag.hinted_pixel_size,
-                            true,
-                        );
-                    }
-                }
-            }
-            Event::SoftBreak => {
-                if soft_break_as_space {
-                    current_spans.push(Span::raw(" ".to_string()));
-                } else {
+                Event::HardBreak => {
                     push_line(&mut lines, &mut current_spans);
                 }
-            }
-            Event::HardBreak => {
-                push_line(&mut lines, &mut current_spans);
-            }
-            Event::Rule => {
-                blank_line(&mut lines, &mut current_spans);
-                lines.push(Line::from(Span::styled(
-                    "─".repeat(72),
-                    Style::default().add_modifier(Modifier::DIM),
-                )));
-            }
-            Event::TaskListMarker(done) => {
-                let marker = if done { "[x] " } else { "[ ] " };
-                current_spans.push(Span::styled(
-                    marker.to_string(),
-                    Style::default().add_modifier(Modifier::BOLD),
-                ));
-            }
-            Event::FootnoteReference(name) => {
-                current_spans.push(Span::styled(
-                    format!("[^{name}]"),
-                    Style::default().add_modifier(Modifier::DIM),
-                ));
-            }
-            Event::InlineMath(text) | Event::DisplayMath(text) => {
-                current_spans.push(Span::styled(
-                    format!("${text}$"),
-                    Style::default().add_modifier(Modifier::ITALIC),
-                ));
-            }
-            Event::InlineHtml(text) => {
-                let html = text.to_string();
-                let html_images = extract_html_images(&html);
-                if html_images.is_empty() {
+                Event::Rule => {
+                    blank_line(&mut lines, &mut current_spans);
+                    lines.push(Line::from(Span::styled(
+                        "─".repeat(72),
+                        Style::default().add_modifier(Modifier::DIM),
+                    )));
+                }
+                Event::TaskListMarker(done) => {
+                    let marker = if done { "[x] " } else { "[ ] " };
                     current_spans.push(Span::styled(
-                        html,
+                        marker.to_string(),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ));
+                }
+                Event::FootnoteReference(name) => {
+                    current_spans.push(Span::styled(
+                        format!("[^{name}]"),
                         Style::default().add_modifier(Modifier::DIM),
                     ));
-                } else {
-                    blank_line(&mut lines, &mut current_spans);
-                    for image_tag in html_images {
-                        append_image_entry(
-                            &mut lines,
-                            &mut images,
-                            image_tag.src,
-                            image_tag.alt,
-                            image_tag.hinted_pixel_size,
-                            true,
-                        );
-                    }
                 }
+                Event::InlineMath(text) | Event::DisplayMath(text) => {
+                    current_spans.push(Span::styled(
+                        format!("${text}$"),
+                        Style::default().add_modifier(Modifier::ITALIC),
+                    ));
+                }
+                Event::Html(_) | Event::InlineHtml(_) => {}
             }
         }
     }
@@ -724,76 +785,6 @@ fn push_line_or_blank(lines: &mut Vec<Line<'static>>, spans: &mut Vec<Span<'stat
 pub fn read_markdown_file(path: &std::path::Path) -> Result<String> {
     std::fs::read_to_string(path)
         .with_context(|| format!("failed to read file: {}", path.display()))
-}
-
-fn extract_html_images(html: &str) -> Vec<HtmlImageTag> {
-    static IMG_TAG_RE: OnceLock<Regex> = OnceLock::new();
-    static SRC_RE: OnceLock<Regex> = OnceLock::new();
-    static ALT_RE: OnceLock<Regex> = OnceLock::new();
-    static WIDTH_RE: OnceLock<Regex> = OnceLock::new();
-    static HEIGHT_RE: OnceLock<Regex> = OnceLock::new();
-
-    let img_tag_re = IMG_TAG_RE
-        .get_or_init(|| Regex::new(r#"(?is)<img\b[^>]*>"#).expect("valid image tag regex"));
-    let src_re = SRC_RE.get_or_init(|| {
-        Regex::new(r#"(?is)\bsrc\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+))"#)
-            .expect("valid src regex")
-    });
-    let alt_re = ALT_RE.get_or_init(|| {
-        Regex::new(r#"(?is)\balt\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+))"#)
-            .expect("valid alt regex")
-    });
-    let width_re = WIDTH_RE.get_or_init(|| {
-        Regex::new(r#"(?is)\bwidth\s*=\s*(?:"([0-9]+)(?:px)?"|'([0-9]+)(?:px)?'|([0-9]+)(?:px)?)"#)
-            .expect("valid width regex")
-    });
-    let height_re = HEIGHT_RE.get_or_init(|| {
-        Regex::new(r#"(?is)\bheight\s*=\s*(?:"([0-9]+)(?:px)?"|'([0-9]+)(?:px)?'|([0-9]+)(?:px)?)"#)
-            .expect("valid height regex")
-    });
-
-    img_tag_re
-        .find_iter(html)
-        .filter_map(|m| {
-            let tag = m.as_str();
-            let src = src_re
-                .captures(tag)
-                .and_then(|caps| first_non_empty_capture_owned(&caps))?;
-            let alt = alt_re
-                .captures(tag)
-                .and_then(|caps| first_non_empty_capture_owned(&caps))
-                .unwrap_or_default();
-            let hinted_pixel_size = parse_image_hint_from_tag(tag, width_re, height_re);
-            Some(HtmlImageTag {
-                src,
-                alt,
-                hinted_pixel_size,
-            })
-        })
-        .collect()
-}
-
-fn parse_image_hint_from_tag(tag: &str, width_re: &Regex, height_re: &Regex) -> Option<(u32, u32)> {
-    let width = parse_html_dimension_attr(tag, width_re);
-    let height = parse_html_dimension_attr(tag, height_re);
-    match (width, height) {
-        (Some(w), Some(h)) if w > 0 && h > 0 => Some((w, h)),
-        _ => None,
-    }
-}
-
-fn parse_html_dimension_attr(tag: &str, attr_re: &Regex) -> Option<u32> {
-    let caps = attr_re.captures(tag)?;
-    let raw = first_non_empty_capture_owned(&caps)?;
-    raw.parse::<u32>().ok().filter(|value| *value > 0)
-}
-
-fn first_non_empty_capture_owned(caps: &regex::Captures<'_>) -> Option<String> {
-    (1..caps.len())
-        .filter_map(|idx| caps.get(idx))
-        .map(|m| m.as_str())
-        .find(|value| !value.is_empty())
-        .map(ToString::to_string)
 }
 
 #[cfg(test)]
@@ -1008,5 +999,92 @@ mod tests {
             .expect("fallback code span should exist");
 
         assert!(code_span.style.add_modifier.contains(Modifier::DIM));
+    }
+
+    #[test]
+    fn html_blocks_render_like_markdown() {
+        let doc = render_markdown(
+            "<h2>Title</h2>\n<p>Some <b>bold</b> &amp; <code>code</code><br>next</p>\n<ul>\n  <li>one\n  <li>two</li>\n</ul>\n<!-- hidden -->",
+        )
+        .unwrap();
+        let lines: Vec<String> = doc.lines.iter().map(ToString::to_string).collect();
+        assert_eq!(
+            lines,
+            [
+                "Title",
+                "",
+                "Some bold & `code`",
+                "next",
+                "",
+                "• one",
+                "• two"
+            ]
+        );
+        assert!(doc.lines[2]
+            .spans
+            .iter()
+            .any(|s| s.content.trim() == "bold" && s.style.add_modifier.contains(Modifier::BOLD)));
+    }
+
+    #[test]
+    fn inline_html_styles_and_links() {
+        assert_eq!(
+            text("Press <kbd>q</kbd> to <a href=\"https://x.y\">quit</a> <!-- c -->now"),
+            ["Press  q  to quit (https://x.y) now"]
+        );
+        let doc = render_markdown("a <u>b</u> c").unwrap();
+        assert!(doc.lines[0]
+            .spans
+            .iter()
+            .any(|s| s.content == "b" && s.style.add_modifier.contains(Modifier::UNDERLINED)));
+        assert!(!doc.lines[0]
+            .spans
+            .iter()
+            .any(|s| s.content == " c" && s.style.add_modifier.contains(Modifier::UNDERLINED)));
+    }
+
+    #[test]
+    fn html_alignment_spans_markdown_blocks() {
+        let doc = render_markdown(
+            "<div align=\"center\">\n\n# Title\n\ntext\n\n</div>\n\nafter\n\n<p align=\"right\">r</p>",
+        )
+        .unwrap();
+        let find = |t: &str| {
+            doc.lines
+                .iter()
+                .find(|l| l.to_string() == t)
+                .unwrap()
+                .alignment
+        };
+        assert_eq!(find("Title"), Some(LineAlignment::Center));
+        assert_eq!(find("text"), Some(LineAlignment::Center));
+        assert_eq!(find("after"), None);
+        assert_eq!(find("r"), Some(LineAlignment::Right));
+    }
+
+    #[test]
+    fn html_tables_and_details() {
+        assert_eq!(
+            text("<table>\n<tr><th>Key<th>Action</tr>\n<tr><td><kbd>j</kbd></td><td>down<br>one</td></tr>\n</table>"),
+            [
+                "┌─────┬──────────┐",
+                "│ Key │ Action   │",
+                "├─────┼──────────┤",
+                "│  j  │ down one │",
+                "└─────┴──────────┘",
+            ]
+        );
+        assert_eq!(
+            text("<details>\n<summary>More</summary>\n\nHidden *text*\n\n</details>"),
+            ["▼ More", "", "Hidden text"]
+        );
+    }
+
+    #[test]
+    fn html_pre_preserves_whitespace() {
+        assert_eq!(
+            text("<pre lang=\"rust\">\nfn  main() {\n    &lt;x&gt;\n}\n</pre>"),
+            ["```rust", "  fn  main() {", "      <x>", "  }", "```"]
+        );
     }
 }

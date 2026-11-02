@@ -29,6 +29,8 @@ Press `?` for help and `q` to quit. Other install options are in [Install](#inst
 - Word wrapping that keeps scrolling, search, selection, and images aligned
 - Unicode-aware layout, including wide characters and emoji
 - Optional maximum content width (`--width 80`)
+- Lightweight rendering of embedded HTML: headings, paragraphs, lists, tables, links, `<pre>`,
+  `<details>`, inline styles (`<b>`, `<kbd>`, `<code>`, …), entities, and `align`/`<center>`
 
 **Images**
 - Markdown images (`![alt](...)`) and HTML `<img>` tags
