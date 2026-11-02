@@ -20,7 +20,7 @@ use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
-    text::{Line, Span},
+    text::{Line, Span, Text},
     widgets::{Block, Borders, Clear, Paragraph},
     Terminal,
 };
@@ -1605,6 +1605,19 @@ impl Drop for TuiGuard {
     }
 }
 
+fn render_content(
+    frame: &mut ratatui::Frame,
+    block: Block<'_>,
+    area: Rect,
+    width: u16,
+    text: Text<'static>,
+) {
+    let mut inner = block.inner(area);
+    inner.width = inner.width.min(width);
+    frame.render_widget(block, area);
+    frame.render_widget(Paragraph::new(text), inner);
+}
+
 pub fn run(
     file_path: PathBuf,
     start_line: usize,
@@ -1698,9 +1711,7 @@ pub fn run(
                 // Layout already produced physical rows. Slice with usize so long
                 // documents do not wrap the scroll offset at 65,536 lines.
                 let text = viewport_text(std::mem::take(&mut display_doc.lines), app.scroll, viewport_height);
-                let paragraph = Paragraph::new(text).block(content_block);
-
-                frame.render_widget(paragraph, chunks[0]);
+                render_content(frame, content_block, chunks[0], content_width, text);
 
                 for plan in &display_doc.image_plans {
                     let plan_top = plan.start_row;
@@ -2537,7 +2548,7 @@ fn rasterize_svg_tree(tree: &resvg::usvg::Tree) -> Option<image::DynamicImage> {
     );
     // tiny-skia stores premultiplied RGBA; convert to straight alpha for `image`.
     let mut data = pixmap.take();
-    for px in data.chunks_exact_mut(4) {
+    for px in data.as_chunks_mut::<4>().0 {
         let alpha = px[3];
         if alpha != 0 && alpha != 255 {
             for channel in &mut px[..3] {
@@ -2726,6 +2737,26 @@ mod tests {
             text_image_mode: None,
             highlighted_lines_cache: None,
         }
+    }
+
+    #[test]
+    fn configured_width_clips_code_inside_full_terminal_border() {
+        use ratatui::backend::TestBackend;
+        let mut terminal = Terminal::new(TestBackend::new(12, 3)).unwrap();
+        terminal
+            .draw(|frame| {
+                render_content(
+                    frame,
+                    Block::default().borders(Borders::ALL),
+                    Rect::new(0, 0, 12, 3),
+                    5,
+                    Text::from("abcdefghij"),
+                );
+            })
+            .unwrap();
+        terminal
+            .backend()
+            .assert_buffer_lines(["┌──────────┐", "│abcde     │", "└──────────┘"]);
     }
 
     #[test]
