@@ -4,6 +4,18 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.6.7] - 2026-11-02
+
+### Changed
+- Improved word wrapping so scrolling, search, rectangular selection, and inline images stay aligned.
+- Made layout and cursor movement Unicode-aware, including wide characters and emoji.
+- Improved table alignment and header styling, and preserved blank lines and tab spacing in code blocks.
+- Kept the cursor anchored to its text when resizing the terminal.
+
+### Added
+- Makefile commands for building, installing, and checking the project.
+- A rendering showcase and CI checks on Linux and macOS.
+
 ## [0.6.3] - 2026-02-13
 
 ### Changed
