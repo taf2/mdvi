@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.6.9] - 2026-11-02
+
 ### Added
 - SVG image support (local and remote), rasterized with `resvg`.
 - Text-mode image renderer (`--image-protocol symbols`, default when no graphics protocol is
