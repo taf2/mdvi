@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.6.8] - 2026-11-02
+
+### Fixed
+- Kept wide table columns aligned instead of wrapping table rows.
+- Added horizontal table scrolling with cursor movement and revealed search matches in off-screen columns.
+- Preserved table cursor positions on resize and Unicode character alignment when clipping.
+
 ## [0.6.7] - 2026-11-02
 
 ### Changed
