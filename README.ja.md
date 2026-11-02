@@ -11,8 +11,10 @@ Markdown を洗練されたフルスクリーン TUI として描画し、高速
 
 - フルスクリーンのターミナルビューア（`crossterm` + `ratatui`）
 - Vim スタイルのナビゲーション操作
-- 表示されるカーソルと、ステータスバー内の `line:column` 形式のカーソル位置
+- 視認できるカーソルと、ステータスバー内の `line:column` 形式のカーソル位置
 - `pulldown-cmark` による高品質な Markdown 描画
+- スクロール、検索、選択、インライン画像の位置関係を保つ折り返し表示
+- 全角文字や絵文字を含む、Unicode に対応したレイアウトとカーソル移動
 - 次の要素をサポート：
   - 見出し
   - リストとタスクリスト
@@ -20,9 +22,11 @@ Markdown を洗練されたフルスクリーン TUI として描画し、高速
   - インライン Markdown 画像（`![alt](...)`）と HTML の `<img ...>` タグ
   - 画像を遅延読み込みしつつ、プレースホルダー用の領域を即座に確保
   - シンタックスハイライト付きのフェンスコードブロックとインラインコード
-  - リンク、表、脚注、強調、太字、取り消し線
-- `--image-protocol` で画像バックエンドを設定可能（`auto`、`halfblocks`、`sixel`、`kitty`、`iterm2`）
-- ディスク上のファイル変更時にライブリロード（`r`）
+  - リンク、列が整列しヘッダーを識別しやすい表、脚注、強調、太字、取り消し線
+- `--image-protocol` で画像バックエンドを設定可能（`auto`、`symbols`、`halfblocks`、`sixel`、`kitty`、`iterm2`）
+- `resvg` でラスタライズする SVG 画像
+- グラフィックスプロトコルのないターミナルでも、精細なテキストモード画像を表示：各セルに最適な六分割・四分割・八分割のブロック文字を選び、SVG の文字は鮮明なターミナル文字として描画
+- 必要に応じてディスクから再読み込み（`r`）
 - 指定行から開始（`--line`）
 - 標準的なターミナルキーに対応（矢印キー、Page Up/Down、Home/End）
 
@@ -30,8 +34,13 @@ Markdown を洗練されたフルスクリーン TUI として描画し、高速
 - ローカル、`file://`、リモートの `http://` / `https://` 画像ソースに対応しています。
 - HTML の `<img>` にある `width` と `height` の指定は、遅延読み込みの完了前に画像領域を確保するために使用されます。
 - macOS では、ターミナルネイティブの画像プロトコルによって「Allow Terminal-Initiated Display?」という確認が表示される場合があります。
-  このダイアログを表示せずに画像を描画するには、`--image-protocol halfblocks` を使用してください。
+  このダイアログを表示せずに画像を描画するには、`--image-protocol symbols` を使用してください。
+- GNOME Terminal は SIXEL が無効の状態で提供されます。その場合、mdvi はテキストモード画像を使用し、フル解像度の画像を有効にする `gsettings` コマンドをステータスバーに表示します。
 - 言語タグ付きのフェンスコードブロック（たとえば `rust` と指定したブロック）は、シンタックスハイライト付きで描画されます。
+- コードブロックは空行を保持し、タブを 4 列ごとのタブ位置まで展開します。
+- ターミナルのサイズを変更しても、カーソルは同じテキスト位置に保たれます。幅が変わると画面座標が変化するため、矩形選択は解除されます。
+
+`make run ARGS='examples/rendering.md'` で描画サンプルを試せます。
 
 ## インストール
 
@@ -44,14 +53,29 @@ brew install mdvi
 
 ### ソースから
 
+最新の安定版 Rust ツールチェーン（Cargo を含む）、C リンカー、Make をインストールしてください。
+プロジェクトのルートで次を実行すると、最適化された実行ファイルをビルドできます。
+
 ```bash
-cargo install --path .
+make
+./target/release/mdvi README.md
 ```
+
+初回のビルドでは依存関係をダウンロードするため時間がかかりますが、次回以降は Cargo のキャッシュを再利用します。
+`mdvi` を Cargo の実行ファイルディレクトリ（通常は `~/.cargo/bin`）にインストールするには、次を実行します。
+
+```bash
+make install
+```
+
+Make がない場合は、`cargo build --release --locked` でビルド、または
+`cargo install --locked --path .` でインストールできます。インストールしたコマンドを使う際は、Cargo の実行ファイルディレクトリが `PATH` に含まれていることを確認してください。
 
 ### インストールせずに実行
 
 ```bash
-cargo run -- README.md
+make run
+make run ARGS='--image-protocol symbols README.md'
 ```
 
 ## 使い方
@@ -65,13 +89,17 @@ mdvi [OPTIONS] <PATH>
 ```bash
 mdvi docs/spec.md
 mdvi --line 120 CHANGELOG.md
-mdvi --image-protocol halfblocks README.md
+mdvi --image-protocol symbols README.md
 ```
 
 ## ナビゲーション
 
 - `j` / `Down`：1 行下にスクロール
 - `k` / `Up`：1 行上にスクロール
+- `h` / `Left`、`l` / `Right`：カーソルを左右に移動
+- 幅の広い表でも列の整列を維持します。`l` / `h` または矢印キーで左右に移動すると、表を横方向にスクロールできます。
+- `w` / `b`：次 / 前の単語へ移動
+- `W` / `B`：次 / 前の空白区切りの語へ移動
 - `d`：半ページ下にスクロール（less スタイル）
 - `u`：半ページ上にスクロール（less スタイル）
 - `Ctrl-d`：半ページ下にスクロール
@@ -86,8 +114,15 @@ mdvi --image-protocol halfblocks README.md
 - `/`：検索を開始
 - `n`：次の検索一致へ移動
 - `N`：前の検索一致へ移動
+- `Enter`：検索を確定；`Esc`：検索入力をキャンセル
+- `Ctrl-v`：矩形選択を切り替え；`y`：選択範囲をクリップボードにコピー
+- `Esc`：矩形選択を解除
 - `?`：ヘルプ行の表示を切り替え
 - `q`：終了
+- `Ctrl-c`：どのモードからでも終了
+
+検索は文字列をそのまま照合し、大文字と小文字を区別しません。空の検索を確定するとハイライトを解除できます。
+クリップボードへのコピーには、実行環境で対応するクリップボードサービスが必要です。
 
 ## Rust を選ぶ理由
 
@@ -95,16 +130,23 @@ Rust は本格的な CLI ビューアに適しています。
 
 - 精密なターミナル制御
 - 大きなファイルでも優れたパフォーマンス
-- 単一の静的バイナリとして配布可能
+- 単一の実行ファイルとして配布可能
 - TUI と Markdown 解析の成熟したエコシステム
 
 ## 開発
 
 ```bash
-cargo test
-cargo fmt
-cargo clippy -- -D warnings
+make help     # すべてのコマンドを表示
+make check    # フォーマット検査、テスト、Clippy（警告はエラーとして扱う）
+make fmt      # Rust ソースを整形
+make test     # テストのみ実行
+make debug    # target/debug/mdvi に開発用の高速ビルドを作成
+make clean    # ビルド成果物を削除
 ```
+
+ビルドとテストでは、再現性を確保するため、コミット済みの `Cargo.lock` と `--locked` を使用します。
+CI は Linux と macOS で検査とリリースビルドを実行します。`make CARGO=/path/to/cargo` で Cargo を指定でき、
+`CARGO_TARGET_DIR` や `CARGO_BUILD_JOBS` などの標準 Cargo 環境変数も使用できます。
 
 ## ライセンス
 
