@@ -7,6 +7,7 @@ use std::{
     time::Duration,
 };
 
+use crate::cellart::{CellArt, CellArtMode, LabelAnchor, TextLabel};
 use anyhow::{Context, Result};
 use arboard::Clipboard;
 use crossterm::{
@@ -19,8 +20,8 @@ use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
-    text::{Line, Span, Text},
-    widgets::{Block, Borders, Clear, Paragraph, Wrap},
+    text::{Line, Span},
+    widgets::{Block, Borders, Clear, Paragraph},
     Terminal,
 };
 use ratatui_image::{
@@ -29,9 +30,11 @@ use ratatui_image::{
     CropOptions, Resize, ResizeEncodeRender,
 };
 use regex::{Regex, RegexBuilder};
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 use crate::{
+    layout::{clip_line, viewport_text, wrap_line, wrapped_ranges},
     renderer::{read_markdown_file, render_markdown, RenderedDoc},
     ImageProtocol,
 };
@@ -65,6 +68,9 @@ struct App {
     image_resize_tx: Sender<ImageResizeRequest>,
     image_resize_rx: Receiver<ImageResizeResult>,
     virtual_row_count_cache: BTreeMap<u16, usize>,
+    image_max_rows: usize,
+    /// Set when images are drawn with Unicode block glyphs instead of a graphics protocol.
+    text_image_mode: Option<CellArtMode>,
     highlighted_lines_cache: Option<HighlightedLinesCache>,
 }
 
@@ -81,6 +87,16 @@ struct InlineImage {
     pixel_size: Option<(u32, u32)>,
     hinted_pixel_size: Option<(u32, u32)>,
     load_state: ImageLoadState,
+    /// Full-resolution decoded image; protocols are built from a copy fitted to the layout box.
+    source_image: Option<image::DynamicImage>,
+    /// (content width, rows) the current protocols were fitted for.
+    fitted_for: Option<(u16, usize)>,
+    /// Bumped whenever protocols are rebuilt so stale resize results can be discarded.
+    generation: u64,
+    /// Pre-rendered text-mode cells, used when the terminal has no pixel graphics protocol.
+    cell_art: Option<CellArt>,
+    /// Text pulled out of vector images, drawn as terminal characters in text mode.
+    text_labels: Vec<TextLabel>,
 }
 
 struct ImageRenderPlan {
@@ -148,13 +164,14 @@ struct ImageLoadResult {
 #[derive(Debug, Clone)]
 enum ImageLoadJob {
     ProbeLocalDimensions(PathBuf),
-    LoadImage(ResolvedImageSource),
+    /// The flag asks for SVG text as [`TextLabel`]s (and a raster without it) for text mode.
+    LoadImage(ResolvedImageSource, bool),
 }
 
 #[derive(Debug)]
 enum ImageLoadResultPayload {
     ProbedDimensions(Option<(u32, u32)>),
-    LoadedImage(Option<image::DynamicImage>),
+    LoadedImage(Option<image::DynamicImage>, Vec<TextLabel>),
 }
 
 struct ImageResizeRequest {
@@ -163,12 +180,14 @@ struct ImageResizeRequest {
     resize: Resize,
     area: Rect,
     protocol: StatefulProtocol,
+    generation: u64,
 }
 
 struct ImageResizeResult {
     image_index: usize,
     variant: ImageResizeVariant,
     protocol: StatefulProtocol,
+    generation: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -246,6 +265,8 @@ impl App {
             image_resize_tx,
             image_resize_rx,
             virtual_row_count_cache: BTreeMap::new(),
+            image_max_rows: 18,
+            text_image_mode: None,
             highlighted_lines_cache: None,
         };
         app.request_local_dimension_probes();
@@ -384,36 +405,27 @@ impl App {
         self.ensure_cursor_visible(viewport_height, content_width);
     }
 
-    fn cursor_doc_line_for_navigation(&mut self, content_width: u16) -> usize {
-        self.clamp_cursor_row(content_width);
-        self.build_display_doc(content_width)
-            .doc_line_for_row
-            .get(self.cursor_row)
-            .copied()
-            .unwrap_or_else(|| self.doc.lines.len().saturating_sub(1))
-    }
-
     fn image_virtual_bounds(&self, content_width: u16) -> Vec<ImageVirtualBounds> {
         let mut bounds = Vec::new();
-        let mut accumulated_image_rows = 0usize;
-
-        for (image_index, image) in self.images.iter().enumerate() {
-            let height = self.image_height_for(image, content_width);
-            if height == 0 {
-                continue;
+        if self.images.is_empty() {
+            return bounds;
+        }
+        let mut row = 0;
+        for (line_index, line) in self.doc.lines.iter().enumerate() {
+            row += self
+                .line_ranges(line_index, &line_plain_text(line), content_width)
+                .len();
+            if let Some(&image_index) = self.image_index_by_line.get(&line_index) {
+                let height = self.image_height_for(&self.images[image_index], content_width);
+                if height > 0 {
+                    bounds.push(ImageVirtualBounds {
+                        image_index,
+                        start_row: row,
+                        end_row: row + height,
+                    });
+                    row += height;
+                }
             }
-
-            let start_row = image
-                .line_index
-                .saturating_add(1)
-                .saturating_add(accumulated_image_rows);
-            let end_row = start_row.saturating_add(height);
-            bounds.push(ImageVirtualBounds {
-                image_index,
-                start_row,
-                end_row,
-            });
-            accumulated_image_rows = accumulated_image_rows.saturating_add(height);
         }
 
         bounds
@@ -503,24 +515,29 @@ impl App {
             .unwrap_or_default()
     }
 
-    fn visible_line_width_at(&self, index: usize) -> usize {
-        self.line_text_at(index).trim_end().width()
+    fn cursor_row_text(&mut self, content_width: u16) -> String {
+        self.build_display_doc(content_width)
+            .lines
+            .get(self.cursor_row)
+            .map(line_plain_text)
+            .unwrap_or_default()
     }
 
-    fn max_cursor_column_for_line(&self, index: usize) -> usize {
-        self.visible_line_width_at(index).saturating_sub(1)
+    fn effective_cursor_column(&mut self, content_width: u16) -> usize {
+        let text = self.cursor_row_text(content_width);
+        Self::clamp_column(&text, self.cursor_column)
     }
 
-    fn effective_cursor_column_for_line(&self, index: usize) -> usize {
-        self.cursor_column
-            .min(self.max_cursor_column_for_line(index))
+    fn clamp_column(text: &str, desired: usize) -> usize {
+        let column = desired.min(text.trim_end().width().saturating_sub(1));
+        Self::column_for_byte_index(text, Self::byte_index_for_column(text, column))
     }
 
     fn current_cursor_position(&mut self, content_width: u16) -> CursorPosition {
-        let line_index = self.cursor_doc_line_for_navigation(content_width);
+        self.clamp_cursor_row(content_width);
         CursorPosition {
             row: self.cursor_row,
-            column: self.effective_cursor_column_for_line(line_index),
+            column: self.effective_cursor_column(content_width),
         }
     }
 
@@ -570,7 +587,7 @@ impl App {
             }
 
             let start_byte = Self::byte_index_for_column(visible_text, col_start);
-            let end_byte = Self::byte_index_for_column(visible_text, col_end.min(visible_width));
+            let end_byte = Self::byte_index_after_column(visible_text, col_end.min(visible_width));
             if end_byte <= start_byte {
                 continue;
             }
@@ -579,23 +596,29 @@ impl App {
         }
     }
 
-    fn move_cursor_left(&mut self) {
-        self.cursor_column = self.cursor_column.saturating_sub(1);
+    fn move_cursor_left(&mut self, content_width: u16) {
+        let text = self.cursor_row_text(content_width);
+        let column = Self::clamp_column(&text, self.cursor_column).saturating_sub(1);
+        self.cursor_column = Self::clamp_column(&text, column);
     }
 
-    fn move_cursor_right(&mut self, line_index: usize) {
-        let max_column = self.max_cursor_column_for_line(line_index);
-        self.cursor_column = self.cursor_column.saturating_add(1).min(max_column);
+    fn move_cursor_right(&mut self, content_width: u16) {
+        let text = self.cursor_row_text(content_width);
+        let column = Self::clamp_column(&text, self.cursor_column);
+        let index = Self::byte_index_for_column(&text, column);
+        let advance = text[index..]
+            .graphemes(true)
+            .next()
+            .map(UnicodeWidthStr::width)
+            .unwrap_or(1);
+        self.cursor_column = Self::clamp_column(&text, column.saturating_add(advance));
     }
 
     fn byte_index_for_column(text: &str, target_column: usize) -> usize {
-        let mut column = 0usize;
-        for (idx, ch) in text.char_indices() {
-            let width = ch.width().unwrap_or(0).max(1);
-            if column >= target_column {
-                return idx;
-            }
-            if column + width > target_column {
+        let mut column = 0;
+        for (idx, grapheme) in text.grapheme_indices(true) {
+            let width = grapheme.width();
+            if column >= target_column || column + width > target_column {
                 return idx;
             }
             column += width;
@@ -603,15 +626,25 @@ impl App {
         text.len()
     }
 
-    fn column_for_byte_index(text: &str, target_index: usize) -> usize {
-        let mut column = 0usize;
-        for (idx, ch) in text.char_indices() {
-            if idx >= target_index {
-                break;
-            }
-            column += ch.width().unwrap_or(0).max(1);
+    fn byte_index_after_column(text: &str, column: usize) -> usize {
+        let index = Self::byte_index_for_column(text, column);
+        if Self::column_for_byte_index(text, index) < column {
+            index
+                + text[index..]
+                    .graphemes(true)
+                    .next()
+                    .map(str::len)
+                    .unwrap_or(0)
+        } else {
+            index
         }
-        column
+    }
+
+    fn column_for_byte_index(text: &str, target_index: usize) -> usize {
+        text.grapheme_indices(true)
+            .take_while(|(idx, _)| *idx < target_index)
+            .map(|(_, grapheme)| grapheme.width())
+            .sum()
     }
 
     fn classify_motion_char(ch: char, kind: WordMotionKind) -> u8 {
@@ -683,19 +716,19 @@ impl App {
     }
 
     fn move_to_next_word(&mut self, content_width: u16, kind: WordMotionKind) {
-        let start_line = self.cursor_doc_line_for_navigation(content_width);
-        let start_column = self.effective_cursor_column_for_line(start_line);
-
-        for line_index in start_line..self.doc.lines.len() {
-            let text = self.line_text_at(line_index);
-            let column = if line_index == start_line {
-                start_column
+        let display = self.build_display_doc(content_width);
+        for row in self.cursor_row..display.lines.len() {
+            let text = line_plain_text(&display.lines[row]);
+            let next = if row == self.cursor_row {
+                Self::find_next_word_start(&text, self.cursor_column, kind)
             } else {
-                0
+                text.char_indices()
+                    .find(|(_, ch)| !ch.is_whitespace())
+                    .map(|(idx, _)| Self::column_for_byte_index(&text, idx))
             };
-            if let Some(next_column) = Self::find_next_word_start(&text, column, kind) {
-                self.cursor_column = next_column;
-                self.cursor_row = self.virtual_row_for_doc_line(line_index, content_width);
+            if let Some(column) = next {
+                self.cursor_column = column;
+                self.cursor_row = row;
                 self.focused_image = None;
                 return;
             }
@@ -703,19 +736,20 @@ impl App {
     }
 
     fn move_to_prev_word(&mut self, content_width: u16, kind: WordMotionKind) {
-        let start_line = self.cursor_doc_line_for_navigation(content_width);
-        let start_column = self.effective_cursor_column_for_line(start_line);
-
-        for line_index in (0..=start_line).rev() {
-            let text = self.line_text_at(line_index);
-            let column = if line_index == start_line {
-                start_column
+        let display = self.build_display_doc(content_width);
+        for row in (0..=self.cursor_row.min(display.lines.len().saturating_sub(1))).rev() {
+            let text = line_plain_text(&display.lines[row]);
+            let column = if row == self.cursor_row {
+                self.cursor_column
             } else {
                 text.width()
             };
-            if let Some(prev_column) = Self::find_prev_word_start(&text, column, kind) {
-                self.cursor_column = prev_column;
-                self.cursor_row = self.virtual_row_for_doc_line(line_index, content_width);
+            if column == 0 {
+                continue;
+            }
+            if let Some(column) = Self::find_prev_word_start(&text, column, kind) {
+                self.cursor_column = column;
+                self.cursor_row = row;
                 self.focused_image = None;
                 return;
             }
@@ -753,7 +787,7 @@ impl App {
             }
 
             let start_byte = Self::byte_index_for_column(visible_text, col_start);
-            let end_byte = Self::byte_index_for_column(visible_text, col_end.min(visible_width));
+            let end_byte = Self::byte_index_after_column(visible_text, col_end.min(visible_width));
             lines.push(visible_text[start_byte..end_byte].to_string());
         }
 
@@ -815,8 +849,9 @@ impl App {
             return;
         }
 
-        let target_row = self.virtual_row_for_doc_line(self.search_matches[0], content_width);
+        let target_row = self.virtual_row_for_search_match(self.search_matches[0], content_width);
         self.cursor_row = target_row;
+        self.reveal_table_match(content_width);
         let max_scroll = self.max_scroll(viewport_height, content_width);
         self.scroll = target_row.min(max_scroll);
         self.status = format!("{} matches for /{query}", self.search_matches.len());
@@ -830,9 +865,10 @@ impl App {
         self.active_match = (self.active_match + 1) % self.search_matches.len();
         self.focused_image = None;
         self.invalidate_highlight_cache();
-        let target_row =
-            self.virtual_row_for_doc_line(self.search_matches[self.active_match], content_width);
+        let target_row = self
+            .virtual_row_for_search_match(self.search_matches[self.active_match], content_width);
         self.cursor_row = target_row;
+        self.reveal_table_match(content_width);
         let max_scroll = self.max_scroll(viewport_height, content_width);
         self.scroll = target_row.min(max_scroll);
     }
@@ -849,11 +885,29 @@ impl App {
         }
         self.focused_image = None;
         self.invalidate_highlight_cache();
-        let target_row =
-            self.virtual_row_for_doc_line(self.search_matches[self.active_match], content_width);
+        let target_row = self
+            .virtual_row_for_search_match(self.search_matches[self.active_match], content_width);
         self.cursor_row = target_row;
+        self.reveal_table_match(content_width);
         let max_scroll = self.max_scroll(viewport_height, content_width);
         self.scroll = target_row.min(max_scroll);
+    }
+
+    fn reveal_table_match(&mut self, width: u16) {
+        let Some(index) = self.active_match_line() else {
+            return;
+        };
+        if self.doc.tables.iter().any(|table| table.contains(&index)) {
+            let text = self.line_text_at(index);
+            if let Some(found) = self
+                .search_regex
+                .as_ref()
+                .and_then(|regex| regex.find(&text))
+            {
+                self.cursor_column = text[..found.start()].width();
+                self.cursor_row = self.virtual_row_for_doc_line(index, width);
+            }
+        }
     }
 
     fn active_match_line(&self) -> Option<usize> {
@@ -902,14 +956,103 @@ impl App {
         }
     }
 
+    fn line_ranges(&self, index: usize, text: &str, width: u16) -> Vec<std::ops::Range<usize>> {
+        if self.doc.tables.iter().any(|table| table.contains(&index)) {
+            std::iter::once(0..text.len()).collect()
+        } else {
+            wrapped_ranges(text, width)
+        }
+    }
+
+    // Clip only the active table, keeping all its rows at the same horizontal offset.
+    // Navigation and selection continue to use the complete, unwrapped rows.
+    fn pan_table(&self, display: &mut DisplayDoc, width: u16, column: usize) -> usize {
+        let Some(index) = display.doc_line_for_row.get(self.cursor_row) else {
+            return 0;
+        };
+        let Some(table) = self.doc.tables.iter().find(|table| table.contains(index)) else {
+            return 0;
+        };
+        let offset = column.saturating_sub(usize::from(width.saturating_sub(1)));
+        if offset > 0 {
+            for (line, index) in display.lines.iter_mut().zip(&display.doc_line_for_row) {
+                if table.contains(index) {
+                    *line = clip_line(line, offset, usize::from(width));
+                }
+            }
+        }
+        offset
+    }
+
     fn virtual_row_for_doc_line(&self, line_index: usize, content_width: u16) -> usize {
-        let mut row = line_index;
+        let mut row = self
+            .doc
+            .lines
+            .iter()
+            .take(line_index)
+            .enumerate()
+            .map(|(index, line)| {
+                self.line_ranges(index, &line_plain_text(line), content_width)
+                    .len()
+            })
+            .sum::<usize>();
         for image in &self.images {
             if image.line_index < line_index {
                 row += self.image_height_for(image, content_width);
             }
         }
         row
+    }
+
+    fn reflow_cursor(&mut self, old_width: u16, new_width: u16) {
+        let display = self.build_display_doc(old_width);
+        let Some(&line_index) = display.doc_line_for_row.get(self.cursor_row) else {
+            return;
+        };
+        let screen_row = self.cursor_row.saturating_sub(self.scroll);
+        let first_row = self.virtual_row_for_doc_line(line_index, old_width);
+        let text = self.line_text_at(line_index);
+        let ranges = self.line_ranges(line_index, &text, old_width);
+        let range = ranges
+            .get(self.cursor_row.saturating_sub(first_row))
+            .unwrap_or(&ranges[0]);
+        let byte =
+            range.start + Self::byte_index_for_column(&text[range.clone()], self.cursor_column);
+        let new_ranges = self.line_ranges(line_index, &text, new_width);
+        let offset = new_ranges
+            .iter()
+            .position(|r| r.contains(&byte))
+            .unwrap_or(new_ranges.len() - 1);
+        self.cursor_row = self.virtual_row_for_doc_line(line_index, new_width) + offset;
+        self.cursor_column = text[new_ranges[offset].start..byte].width();
+        if let Some(image) = self.focused_image {
+            if let Some(bounds) = self.image_bounds_for(image, new_width) {
+                self.cursor_row = bounds.start_row;
+            }
+        }
+        self.scroll = self.cursor_row.saturating_sub(screen_row);
+        // A rectangle's screen coordinates no longer describe the same text.
+        if matches!(self.mode, Mode::VisualBlock(_)) {
+            self.mode = Mode::Normal;
+        }
+    }
+
+    fn virtual_row_for_search_match(&self, line_index: usize, content_width: u16) -> usize {
+        let first_row = self.virtual_row_for_doc_line(line_index, content_width);
+        let text = self.line_text_at(line_index);
+        let match_start = self
+            .search_regex
+            .as_ref()
+            .and_then(|regex| regex.find(&text))
+            .map(|m| m.start());
+        let offset = match_start
+            .and_then(|start| {
+                self.line_ranges(line_index, &text, content_width)
+                    .iter()
+                    .position(|range| range.contains(&start))
+            })
+            .unwrap_or(0);
+        first_row + offset
     }
 
     fn effective_image_pixel_size(&self, image: &InlineImage) -> Option<(u32, u32)> {
@@ -926,8 +1069,6 @@ impl App {
     }
 
     fn image_height_for(&self, image: &InlineImage, content_width: u16) -> usize {
-        const MAX_IMAGE_CELL_HEIGHT: usize = 18;
-
         let Some((pixel_width, pixel_height)) = self.effective_image_pixel_size(image) else {
             return 0;
         };
@@ -945,7 +1086,79 @@ impl App {
             .div_ceil(u64::from(pixel_width)) as u32;
         let height_cells = target_pixel_height.div_ceil(font_height).max(1) as usize;
 
-        height_cells.min(MAX_IMAGE_CELL_HEIGHT)
+        height_cells.min(self.image_max_rows)
+    }
+
+    /// Images may use most of the viewport so diagrams stay legible, but never
+    /// less than the historical 18-row allowance (when the viewport has room).
+    fn set_viewport_height(&mut self, viewport_height: usize) {
+        const MIN_IMAGE_CELL_HEIGHT: usize = 18;
+        let max_rows = (viewport_height * 4 / 5)
+            .max(MIN_IMAGE_CELL_HEIGHT.min(viewport_height))
+            .max(1);
+        if max_rows != self.image_max_rows {
+            self.image_max_rows = max_rows;
+            self.invalidate_virtual_row_cache();
+        }
+    }
+
+    /// Downscale the decoded image once, with a high-quality filter, to the exact pixel
+    /// box its layout rows occupy. Terminal protocols then only crop or no-op resize it,
+    /// which avoids nearest-neighbor artifacts and keeps partially scrolled images at the
+    /// same scale as fully visible ones.
+    fn fit_image_to_layout(&mut self, image_index: usize, content_width: u16, rows: usize) {
+        let (font_width, font_height) = self.picker.font_size();
+        let Some(image) = self.images.get_mut(image_index) else {
+            return;
+        };
+        if image.fitted_for == Some((content_width, rows)) {
+            return;
+        }
+        let Some(source) = image.source_image.as_ref() else {
+            return;
+        };
+        let box_width = u32::from(content_width) * u32::from(font_width.max(1));
+        let box_height = rows as u32 * u32::from(font_height.max(1));
+
+        if let Some(mode) = self.text_image_mode {
+            // Size in cells from the on-screen pixel box, so the cell aspect ratio is honoured.
+            let (width, height) = (source.width().max(1), source.height().max(1));
+            let scale = (f64::from(box_width) / f64::from(width))
+                .min(f64::from(box_height) / f64::from(height))
+                .min(1.0);
+            let cols = ((f64::from(width) * scale) / f64::from(font_width.max(1)))
+                .round()
+                .clamp(1.0, f64::from(content_width.max(1))) as u16;
+            let art_rows = ((f64::from(height) * scale) / f64::from(font_height.max(1)))
+                .round()
+                .clamp(1.0, rows.max(1) as f64) as u16;
+            image.cell_art = Some(CellArt::render(
+                source,
+                cols,
+                art_rows,
+                mode,
+                &image.text_labels,
+            ));
+            image.fitted_for = Some((content_width, rows));
+            image.state = None;
+            image.scratch_state = None;
+            image.cached_variants.clear();
+            image.resize_pending = false;
+            image.pending_variant = None;
+            return;
+        }
+
+        let fitted = fit_image_within(source, box_width, box_height);
+
+        image.state = Some(self.picker.new_resize_protocol(fitted.clone()));
+        image.scratch_state = Some(self.picker.new_resize_protocol(fitted));
+        image.fitted_for = Some((content_width, rows));
+        image.generation = image.generation.wrapping_add(1);
+        image.active_variant = None;
+        image.cached_variants.clear();
+        image.resize_pending = false;
+        image.pending_variant = None;
+        image.has_encoded_state = false;
     }
 
     fn image_progress_counts(&self) -> (usize, usize, usize) {
@@ -988,7 +1201,7 @@ impl App {
             .image_loader_tx
             .send(ImageLoadRequest {
                 image_index,
-                job: ImageLoadJob::LoadImage(source),
+                job: ImageLoadJob::LoadImage(source, self.text_image_mode.is_some()),
             })
             .is_ok()
         {
@@ -1118,7 +1331,7 @@ impl App {
         let reference_protocol = image
             .state
             .as_ref()
-            .or_else(|| image.scratch_state.as_ref())
+            .or(image.scratch_state.as_ref())
             .or_else(|| image.cached_variants.values().next())?;
 
         let target_area = reference_protocol.size_for(resize.clone(), area);
@@ -1136,7 +1349,7 @@ impl App {
         let Some(reference_protocol) = image
             .state
             .as_ref()
-            .or_else(|| image.scratch_state.as_ref())
+            .or(image.scratch_state.as_ref())
             .or_else(|| image.cached_variants.values().next())
         else {
             return;
@@ -1176,6 +1389,7 @@ impl App {
             resize,
             area: target_area,
             protocol,
+            generation: image.generation,
         }) {
             Ok(()) => {
                 image.resize_pending = true;
@@ -1199,6 +1413,10 @@ impl App {
             let Some(image) = self.images.get_mut(result.image_index) else {
                 continue;
             };
+            if result.generation != image.generation {
+                // Encoded from a source that has since been re-fitted; drop it.
+                continue;
+            }
             let was_pending_variant = image.pending_variant == Some(result.variant);
             image.resize_pending = false;
             image.pending_variant = None;
@@ -1250,10 +1468,15 @@ impl App {
             };
 
             match result.payload {
-                ImageLoadResultPayload::LoadedImage(Some(dynamic_image)) => {
+                ImageLoadResultPayload::LoadedImage(Some(dynamic_image), labels) => {
+                    image.text_labels = labels;
                     image.pixel_size = Some((dynamic_image.width(), dynamic_image.height()));
                     image.state = Some(self.picker.new_resize_protocol(dynamic_image.clone()));
-                    image.scratch_state = Some(self.picker.new_resize_protocol(dynamic_image));
+                    image.scratch_state = None;
+                    image.source_image = Some(dynamic_image);
+                    image.cell_art = None;
+                    image.fitted_for = None;
+                    image.generation = image.generation.wrapping_add(1);
                     image.active_variant = None;
                     image.cached_variants.clear();
                     image.resize_pending = false;
@@ -1262,8 +1485,11 @@ impl App {
                     image.load_state = ImageLoadState::Loaded;
                     changed = true;
                 }
-                ImageLoadResultPayload::LoadedImage(None) => {
+                ImageLoadResultPayload::LoadedImage(None, _) => {
                     image.state = None;
+                    image.source_image = None;
+                    image.cell_art = None;
+                    image.fitted_for = None;
                     image.scratch_state = None;
                     image.active_variant = None;
                     image.cached_variants.clear();
@@ -1296,8 +1522,18 @@ impl App {
         let mut doc_line_for_row: Vec<usize> = Vec::with_capacity(source_lines.len());
 
         for (line_index, line) in source_lines.into_iter().enumerate() {
-            lines.push(line);
-            doc_line_for_row.push(line_index);
+            let wrapped = if self
+                .doc
+                .tables
+                .iter()
+                .any(|table| table.contains(&line_index))
+            {
+                vec![line]
+            } else {
+                wrap_line(&line, content_width)
+            };
+            doc_line_for_row.extend(std::iter::repeat_n(line_index, wrapped.len()));
+            lines.extend(wrapped);
 
             if let Some(image_index) = self.image_index_by_line.get(&line_index).copied() {
                 let height = self.image_height_for(&self.images[image_index], content_width);
@@ -1331,13 +1567,19 @@ struct TuiGuard {
 impl TuiGuard {
     fn setup() -> Result<Self> {
         enable_raw_mode().context("failed to enable raw mode")?;
-        let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen).context("failed to enter alternate screen")?;
-
-        let backend = CrosstermBackend::new(stdout);
-        let terminal = Terminal::new(backend).context("failed to initialize terminal")?;
-
-        Ok(Self { terminal })
+        let result = (|| {
+            let mut stdout = io::stdout();
+            execute!(stdout, EnterAlternateScreen).context("failed to enter alternate screen")?;
+            let backend = CrosstermBackend::new(stdout);
+            let terminal = Terminal::new(backend).context("failed to initialize terminal")?;
+            Ok(Self { terminal })
+        })();
+        // Drop cannot restore the terminal until a guard has been constructed.
+        if result.is_err() {
+            let _ = disable_raw_mode();
+            let _ = execute!(io::stdout(), LeaveAlternateScreen, crossterm::cursor::Show);
+        }
+        result
     }
 
     fn terminal_mut(&mut self) -> &mut AppTerminal {
@@ -1355,12 +1597,36 @@ impl Drop for TuiGuard {
 
 pub fn run(file_path: PathBuf, start_line: usize, image_protocol: ImageProtocol) -> Result<()> {
     let mut tui = TuiGuard::setup()?;
-    let mut picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::from_fontsize((10, 20)));
-    if let Some(protocol_type) = protocol_override(image_protocol) {
+    let picker = if let Some(protocol_type) = protocol_override(image_protocol) {
+        // Explicit choices must not launch a stdin capability probe: a terminal
+        // that never responds can leave that probe competing for keyboard input.
+        // The window-size query is bounded by a device-attributes reply, so unlike a full
+        // capability probe it cannot leave a pending read competing for keyboard input.
+        let font_size = window_cell_size()
+            .or_else(query_cell_size_from_window_pixels)
+            .unwrap_or((10, 20));
+        let mut picker = Picker::from_fontsize(font_size);
         picker.set_protocol_type(protocol_type);
-    }
+        picker
+    } else {
+        let picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::from_fontsize((10, 20)));
+        with_measured_cell_size(picker)
+    };
+    let uses_text_images = app_uses_text_images(&picker);
     let mut app = App::new(file_path, start_line, picker)?;
+    if uses_text_images {
+        app.text_image_mode = Some(match image_protocol {
+            ImageProtocol::Halfblocks => CellArtMode::HalfBlocks,
+            _ => CellArtMode::Mosaic,
+        });
+        if matches!(image_protocol, ImageProtocol::Auto) && !app.images.is_empty() {
+            if let Some(hint) = graphics_upgrade_hint() {
+                app.status = hint;
+            }
+        }
+    }
     let mut should_redraw = true;
+    let mut last_content_width = None;
 
     loop {
         if app.drain_image_results() {
@@ -1385,6 +1651,17 @@ pub fn run(file_path: PathBuf, start_line: usize, image_protocol: ImageProtocol)
                 let content_inner = content_block.inner(chunks[0]);
                 let content_width = content_inner.width;
                 let viewport_height = usize::from(content_inner.height);
+                app.set_viewport_height(viewport_height);
+                if let Some(old_width) = last_content_width {
+                    if old_width != content_width {
+                        app.reflow_cursor(old_width, content_width);
+                    }
+                } else {
+                    let line = start_line.saturating_sub(1).min(app.doc.lines.len().saturating_sub(1));
+                    app.cursor_row = app.virtual_row_for_doc_line(line, content_width);
+                    app.scroll = app.cursor_row;
+                }
+                last_content_width = Some(content_width);
                 let mut display_doc = app.build_display_doc(content_width);
                 let total_rows = display_doc.lines.len().max(1);
                 let total_doc_lines = app.doc.lines.len().max(1);
@@ -1401,14 +1678,15 @@ pub fn run(file_path: PathBuf, start_line: usize, image_protocol: ImageProtocol)
                     .copied()
                     .unwrap_or_else(|| app.doc.lines.len().saturating_sub(1));
                 let cursor_screen_row = cursor_virtual_row.saturating_sub(app.scroll);
-                let cursor_column = app.effective_cursor_column_for_line(cursor_doc_line);
+                let cursor_column = display_doc.lines.get(cursor_virtual_row)
+                    .map(|line| App::clamp_column(&line_plain_text(line), app.cursor_column)).unwrap_or(0);
 
                 app.apply_visual_selection_to_display_doc(&mut display_doc, content_width);
-                let text = Text::from(std::mem::take(&mut display_doc.lines));
-                let paragraph = Paragraph::new(text)
-                    .block(content_block)
-                    .wrap(Wrap { trim: false })
-                    .scroll((app.scroll as u16, 0));
+                let horizontal_offset = app.pan_table(&mut display_doc, content_width, cursor_column);
+                // Layout already produced physical rows. Slice with usize so long
+                // documents do not wrap the scroll offset at 65,536 lines.
+                let text = viewport_text(std::mem::take(&mut display_doc.lines), app.scroll, viewport_height);
+                let paragraph = Paragraph::new(text).block(content_block);
 
                 frame.render_widget(paragraph, chunks[0]);
 
@@ -1441,8 +1719,24 @@ pub fn run(file_path: PathBuf, start_line: usize, image_protocol: ImageProtocol)
                         continue;
                     }
                     frame.render_widget(Clear, image_area);
+                    app.fit_image_to_layout(plan.image_index, content_width, plan.height);
+                    if app.text_image_mode.is_some() {
+                        if let Some(art) = app.images[plan.image_index].cell_art.as_ref() {
+                            art.draw(visible_top - plan_top, image_area, frame.buffer_mut());
+                        } else {
+                            let placeholder = App::image_placeholder(&app.images[plan.image_index]);
+                            frame.render_widget(
+                                Paragraph::new(Line::from(Span::styled(
+                                    format!("  {placeholder}"),
+                                    Style::default().add_modifier(Modifier::DIM),
+                                ))),
+                                image_area,
+                            );
+                        }
+                    } else {
                     let resize = if is_fully_visible {
-                        Resize::Fit(None)
+                        // Images are pre-fitted with Lanczos; this only guards against rounding.
+                        Resize::Fit(Some(ratatui_image::FilterType::Lanczos3))
                     } else {
                         Resize::Crop(Some(CropOptions {
                             clip_top: visible_top > plan_top,
@@ -1477,6 +1771,7 @@ pub fn run(file_path: PathBuf, start_line: usize, image_protocol: ImageProtocol)
                             ))),
                             image_area,
                         );
+                    }
                     }
 
                     if app.focused_image == Some(plan.image_index) {
@@ -1572,7 +1867,7 @@ pub fn run(file_path: PathBuf, start_line: usize, image_protocol: ImageProtocol)
                                 content_inner.y.saturating_add(cursor_screen_row as u16);
                             let cursor_x = content_inner
                                 .x
-                                .saturating_add(cursor_column as u16)
+                                .saturating_add(cursor_column.saturating_sub(horizontal_offset) as u16)
                                 .min(content_inner.x + content_inner.width.saturating_sub(1));
                             frame.set_cursor_position((cursor_x, cursor_y));
                         }
@@ -1620,10 +1915,141 @@ pub fn run(file_path: PathBuf, start_line: usize, image_protocol: ImageProtocol)
     Ok(())
 }
 
+/// Cell size in pixels from the tty's winsize, when the terminal fills in pixel fields.
+fn window_cell_size() -> Option<(u16, u16)> {
+    let size = crossterm::terminal::window_size().ok()?;
+    let width = size.width.checked_div(size.columns)?;
+    let height = size.height.checked_div(size.rows)?;
+    (width > 0 && height > 0).then_some((width, height))
+}
+
+/// ratatui-image learns the cell size from `CSI 16 t` or the winsize pixel fields and
+/// otherwise silently assumes 10x20. Several terminals (e.g. VTE-based ones) answer
+/// neither, which makes every bitmap the wrong scale. Fill the gap portably.
+fn with_measured_cell_size(picker: Picker) -> Picker {
+    let reported = picker
+        .capabilities()
+        .iter()
+        .any(|cap| matches!(cap, ratatui_image::picker::Capability::CellSize(Some(_))));
+    if reported || window_cell_size().is_some() {
+        return picker;
+    }
+    let Some(font_size) = query_cell_size_from_window_pixels() else {
+        return picker;
+    };
+    let mut measured = Picker::from_fontsize(font_size);
+    measured.set_protocol_type(picker.protocol_type());
+    measured
+}
+
+/// Ask for the text area size in pixels (`CSI 14 t`) and divide by the size in cells.
+/// A trailing primary device attributes query (`CSI c`), which every terminal answers,
+/// bounds the read so nothing is left behind to be mistaken for keyboard input.
+#[cfg(unix)]
+fn query_cell_size_from_window_pixels() -> Option<(u16, u16)> {
+    use std::io::{Read, Write};
+    use std::os::fd::AsRawFd;
+
+    let (columns, rows) = crossterm::terminal::size().ok()?;
+    if columns == 0 || rows == 0 {
+        return None;
+    }
+    let mut stdout = io::stdout();
+    stdout.write_all(b"\x1b[14t\x1b[c").ok()?;
+    stdout.flush().ok()?;
+
+    let stdin = io::stdin();
+    let fd = stdin.as_raw_fd();
+    let deadline = std::time::Instant::now() + Duration::from_millis(500);
+    let mut response = Vec::new();
+    let mut buf = [0u8; 64];
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let mut pollfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: pollfd points at one valid, initialized pollfd for the duration of the call.
+        let ready = unsafe { libc::poll(&mut pollfd, 1, remaining.as_millis() as libc::c_int) };
+        if ready <= 0 {
+            break;
+        }
+        let read = stdin.lock().read(&mut buf).ok()?;
+        if read == 0 {
+            break;
+        }
+        response.extend_from_slice(&buf[..read]);
+        if parse_device_attributes_end(&response) {
+            break;
+        }
+    }
+    let (height, width) = parse_window_pixel_report(&response)?;
+    let cell = (width / columns, height / rows);
+    (cell.0 > 0 && cell.1 > 0).then_some(cell)
+}
+
+#[cfg(not(unix))]
+fn query_cell_size_from_window_pixels() -> Option<(u16, u16)> {
+    None
+}
+
+fn parse_device_attributes_end(response: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(response);
+    text.find("\x1b[?")
+        .is_some_and(|start| text[start..].contains('c'))
+}
+
+/// Parse `ESC [ 4 ; height ; width t` out of a terminal response.
+fn parse_window_pixel_report(response: &[u8]) -> Option<(u16, u16)> {
+    let text = String::from_utf8_lossy(response);
+    let start = text.find("\x1b[4;")? + 4;
+    let end = start + text[start..].find('t')?;
+    let (height, width) = text[start..end].split_once(';')?;
+    Some((height.parse().ok()?, width.parse().ok()?))
+}
+
+fn app_uses_text_images(picker: &Picker) -> bool {
+    picker.protocol_type() == ProtocolType::Halfblocks
+}
+
+/// Terminals that can show real pixels but have it switched off get a one-line hint.
+/// GNOME Terminal (VTE) ships with SIXEL disabled per profile.
+fn graphics_upgrade_hint() -> Option<String> {
+    std::env::var_os("VTE_VERSION")?;
+    if std::env::var_os("GNOME_TERMINAL_SCREEN").is_none()
+        && std::env::var_os("GNOME_TERMINAL_SERVICE").is_none()
+    {
+        return Some(
+            "images in text mode; enable SIXEL in your terminal for full resolution".to_string(),
+        );
+    }
+    let output = std::process::Command::new("gsettings")
+        .args(["get", "org.gnome.Terminal.ProfilesList", "default"])
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    let profile = String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .trim_matches('\'')
+        .to_string();
+    if profile.is_empty() || !profile.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
+        return Some(
+            "images in text mode; enable SIXEL in GNOME Terminal for full resolution".to_string(),
+        );
+    }
+    Some(format!(
+        "images in text mode; for full resolution run: gsettings set org.gnome.Terminal.Legacy.Profile:/org/gnome/terminal/legacy/profiles:/:{profile}/ enable-sixel true  (then reopen mdvi)"
+    ))
+}
+
 fn protocol_override(image_protocol: ImageProtocol) -> Option<ProtocolType> {
     match image_protocol {
         ImageProtocol::Auto => None,
-        ImageProtocol::Halfblocks => Some(ProtocolType::Halfblocks),
+        ImageProtocol::Symbols | ImageProtocol::Halfblocks => Some(ProtocolType::Halfblocks),
         ImageProtocol::Sixel => Some(ProtocolType::Sixel),
         ImageProtocol::Kitty => Some(ProtocolType::Kitty),
         ImageProtocol::Iterm2 => Some(ProtocolType::Iterm2),
@@ -1638,6 +2064,10 @@ fn handle_key_event(
     half_page: usize,
     full_page: usize,
 ) -> bool {
+    // Raw mode disables the terminal's normal Ctrl-C handling, including in search.
+    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        return true;
+    }
     if let Mode::SearchInput(query) = &mut app.mode {
         match key.code {
             KeyCode::Esc => {
@@ -1729,12 +2159,11 @@ fn handle_key_event(
             false
         }
         (KeyCode::Char('h'), _) | (KeyCode::Left, _) => {
-            app.move_cursor_left();
+            app.move_cursor_left(content_width);
             false
         }
         (KeyCode::Char('l'), _) | (KeyCode::Right, _) => {
-            let cursor_doc_line = app.cursor_doc_line_for_navigation(content_width);
-            app.move_cursor_right(cursor_doc_line);
+            app.move_cursor_right(content_width);
             false
         }
         (KeyCode::Char('j'), _) | (KeyCode::Down, _) => {
@@ -1812,6 +2241,11 @@ fn prepare_images_for_doc(markdown_path: &Path, doc: &RenderedDoc) -> Vec<Inline
                 has_encoded_state: false,
                 pixel_size: None,
                 hinted_pixel_size: image.hinted_pixel_size,
+                source_image: None,
+                fitted_for: None,
+                generation: 0,
+                cell_art: None,
+                text_labels: Vec::new(),
                 load_state,
             }
         })
@@ -1841,9 +2275,14 @@ fn image_loader_worker(request_rx: Receiver<ImageLoadRequest>, result_tx: Sender
             ImageLoadJob::ProbeLocalDimensions(path) => {
                 ImageLoadResultPayload::ProbedDimensions(probe_local_image_dimensions(&path))
             }
-            ImageLoadJob::LoadImage(source) => ImageLoadResultPayload::LoadedImage(
-                load_dynamic_image(&source, remote_client.as_ref()),
-            ),
+            ImageLoadJob::LoadImage(source, svg_text_as_labels) => {
+                match load_image(&source, remote_client.as_ref(), svg_text_as_labels) {
+                    Some((image, labels)) => {
+                        ImageLoadResultPayload::LoadedImage(Some(image), labels)
+                    }
+                    None => ImageLoadResultPayload::LoadedImage(None, Vec::new()),
+                }
+            }
         };
         if result_tx
             .send(ImageLoadResult {
@@ -1881,6 +2320,7 @@ fn image_resize_worker(
                 image_index: request.image_index,
                 variant: request.variant,
                 protocol: request.protocol,
+                generation: request.generation,
             })
             .is_err()
         {
@@ -1890,23 +2330,241 @@ fn image_resize_worker(
 }
 
 fn probe_local_image_dimensions(path: &Path) -> Option<(u32, u32)> {
-    let reader = ImageReader::open(path).ok()?;
+    if path_looks_like_svg(path) {
+        let tree = parse_svg(&std::fs::read(path).ok()?)?;
+        let (width, height, _) = svg_raster_size(&tree);
+        return Some((width, height));
+    }
+    let reader = ImageReader::open(path).ok()?.with_guessed_format().ok()?;
     reader.into_dimensions().ok()
 }
 
+#[cfg(test)]
 fn load_dynamic_image(
     source: &ResolvedImageSource,
     remote_client: Option<&reqwest::blocking::Client>,
 ) -> Option<image::DynamicImage> {
-    match source {
-        ResolvedImageSource::Local(path) => ImageReader::open(path).ok()?.decode().ok(),
+    load_image(source, remote_client, false).map(|(image, _)| image)
+}
+
+/// Decode an image. With `svg_text_as_labels`, SVG text is returned as labels and left out
+/// of the raster so text mode can draw it with real terminal characters.
+fn load_image(
+    source: &ResolvedImageSource,
+    remote_client: Option<&reqwest::blocking::Client>,
+    svg_text_as_labels: bool,
+) -> Option<(image::DynamicImage, Vec<TextLabel>)> {
+    let (bytes, is_svg) = match source {
+        ResolvedImageSource::Local(path) => (std::fs::read(path).ok()?, path_looks_like_svg(path)),
         ResolvedImageSource::Remote(url) => {
             let client = remote_client?;
             let response = client.get(url).send().ok()?.error_for_status().ok()?;
-            let bytes = response.bytes().ok()?;
-            image::load_from_memory(&bytes).ok()
+            let is_svg_content_type = response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.contains("svg"));
+            let bytes = response.bytes().ok()?.to_vec();
+            let is_svg = is_svg_content_type || bytes_look_like_svg(&bytes);
+            (bytes, is_svg)
+        }
+    };
+    if !is_svg {
+        return image::load_from_memory(&bytes)
+            .ok()
+            .map(|image| (image, Vec::new()));
+    }
+    if svg_text_as_labels {
+        let labels = parse_svg(&bytes)
+            .map(|tree| svg_text_labels(&tree))
+            .unwrap_or_default();
+        if !labels.is_empty() {
+            if let Some(image) =
+                parse_svg_without_text(&bytes).and_then(|tree| rasterize_svg_tree(&tree))
+            {
+                return Some((image, labels));
+            }
         }
     }
+    rasterize_svg(&bytes).map(|image| (image, Vec::new()))
+}
+
+/// Scale `image` down (never up) to fit inside `max_width` x `max_height`, preserving aspect.
+fn fit_image_within(
+    image: &image::DynamicImage,
+    max_width: u32,
+    max_height: u32,
+) -> image::DynamicImage {
+    let (width, height) = (image.width().max(1), image.height().max(1));
+    if width <= max_width && height <= max_height {
+        return image.clone();
+    }
+    let scale =
+        (f64::from(max_width) / f64::from(width)).min(f64::from(max_height) / f64::from(height));
+    let target_width = ((f64::from(width) * scale).round() as u32).max(1);
+    let target_height = ((f64::from(height) * scale).round() as u32).max(1);
+    image.resize_exact(
+        target_width,
+        target_height,
+        image::imageops::FilterType::Lanczos3,
+    )
+}
+
+/// Upper bound on the longest edge of a rasterized SVG, in pixels.
+const MAX_SVG_RASTER_EDGE: f32 = 2400.0;
+/// Scale factor applied to the SVG's intrinsic size for crisper terminal output.
+const SVG_RASTER_SCALE: f32 = 2.0;
+
+fn path_looks_like_svg(path: &Path) -> bool {
+    let has_svg_extension = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("svg") || ext.eq_ignore_ascii_case("svgz"));
+    has_svg_extension || std::fs::read(path).is_ok_and(|bytes| bytes_look_like_svg(&bytes))
+}
+
+fn bytes_look_like_svg(bytes: &[u8]) -> bool {
+    // gzip data (svgz) is only recognized by extension; otherwise look for an <svg element.
+    if bytes.starts_with(&[0x1f, 0x8b]) {
+        return false;
+    }
+    let head = &bytes[..bytes.len().min(4096)];
+    let text = String::from_utf8_lossy(head);
+    let trimmed = text.trim_start_matches('\u{feff}').trim_start();
+    (trimmed.starts_with('<')) && text.contains("<svg")
+}
+
+fn svg_fontdb() -> std::sync::Arc<resvg::usvg::fontdb::Database> {
+    static FONTDB: std::sync::OnceLock<std::sync::Arc<resvg::usvg::fontdb::Database>> =
+        std::sync::OnceLock::new();
+    FONTDB
+        .get_or_init(|| {
+            let mut db = resvg::usvg::fontdb::Database::new();
+            db.load_system_fonts();
+            std::sync::Arc::new(db)
+        })
+        .clone()
+}
+
+fn parse_svg(bytes: &[u8]) -> Option<resvg::usvg::Tree> {
+    let options = resvg::usvg::Options {
+        fontdb: svg_fontdb(),
+        ..Default::default()
+    };
+    resvg::usvg::Tree::from_data(bytes, &options).ok()
+}
+
+/// Pixel size (and scale factor) an SVG is rasterized at; shared by probing and loading
+/// so the reserved layout height does not change once the image arrives.
+fn svg_raster_size(tree: &resvg::usvg::Tree) -> (u32, u32, f32) {
+    let size = tree.size();
+    let longest = size.width().max(size.height()).max(1.0);
+    let scale = SVG_RASTER_SCALE.min(MAX_SVG_RASTER_EDGE / longest);
+    let width = (size.width() * scale).ceil().max(1.0) as u32;
+    let height = (size.height() * scale).ceil().max(1.0) as u32;
+    (width, height, scale)
+}
+
+/// Parse with no fonts available, which makes usvg drop text nodes entirely.
+fn parse_svg_without_text(bytes: &[u8]) -> Option<resvg::usvg::Tree> {
+    let options = resvg::usvg::Options {
+        fontdb: std::sync::Arc::new(resvg::usvg::fontdb::Database::new()),
+        ..Default::default()
+    };
+    resvg::usvg::Tree::from_data(bytes, &options).ok()
+}
+
+/// Collect every text chunk (one per positioned line) with its anchor point, colour and weight.
+fn svg_text_labels(tree: &resvg::usvg::Tree) -> Vec<TextLabel> {
+    use resvg::usvg::{Node, Paint, TextAnchor};
+
+    fn walk(group: &resvg::usvg::Group, size: (f32, f32), labels: &mut Vec<TextLabel>) {
+        for node in group.children() {
+            match node {
+                Node::Group(child) => walk(child, size, labels),
+                Node::Text(text) => {
+                    let transform = text.abs_transform();
+                    let bbox = text.abs_bounding_box();
+                    for chunk in text.chunks() {
+                        let content = chunk.text().trim();
+                        let Some(span) = chunk.spans().first() else {
+                            continue;
+                        };
+                        if content.is_empty() || !span.is_visible() {
+                            continue;
+                        }
+                        let color = match span.fill().map(|fill| fill.paint()) {
+                            Some(Paint::Color(c)) => [c.red, c.green, c.blue],
+                            _ => [0, 0, 0],
+                        };
+                        let mut point = resvg::tiny_skia::Point::from_xy(
+                            chunk.x().unwrap_or(0.0),
+                            chunk.y().unwrap_or(0.0),
+                        );
+                        transform.map_points(std::slice::from_mut(&mut point));
+                        if chunk.x().is_none() {
+                            point.x = bbox.left();
+                        }
+                        if chunk.y().is_none() {
+                            point.y = bbox.bottom();
+                        }
+                        // Baseline to visual centre of lowercase/caps text.
+                        let font_size =
+                            span.font_size().get() * transform.sy.abs().max(f32::EPSILON);
+                        let center_y = point.y - font_size * 0.35;
+                        labels.push(TextLabel {
+                            x: point.x / size.0,
+                            y: center_y / size.1,
+                            anchor: match chunk.anchor() {
+                                TextAnchor::Start => LabelAnchor::Start,
+                                TextAnchor::Middle => LabelAnchor::Middle,
+                                TextAnchor::End => LabelAnchor::End,
+                            },
+                            text: content.to_string(),
+                            color,
+                            bold: span.font().weight() >= 600,
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let size = tree.size();
+    let mut labels = Vec::new();
+    walk(
+        tree.root(),
+        (size.width().max(1.0), size.height().max(1.0)),
+        &mut labels,
+    );
+    labels
+}
+
+fn rasterize_svg(bytes: &[u8]) -> Option<image::DynamicImage> {
+    rasterize_svg_tree(&parse_svg(bytes)?)
+}
+
+fn rasterize_svg_tree(tree: &resvg::usvg::Tree) -> Option<image::DynamicImage> {
+    let (width, height, scale) = svg_raster_size(tree);
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(width, height)?;
+    resvg::render(
+        tree,
+        resvg::tiny_skia::Transform::from_scale(scale, scale),
+        &mut pixmap.as_mut(),
+    );
+    // tiny-skia stores premultiplied RGBA; convert to straight alpha for `image`.
+    let mut data = pixmap.take();
+    for px in data.chunks_exact_mut(4) {
+        let alpha = px[3];
+        if alpha != 0 && alpha != 255 {
+            for channel in &mut px[..3] {
+                *channel =
+                    ((*channel as u32 * 255 + alpha as u32 / 2) / alpha as u32).min(255) as u8;
+            }
+        }
+    }
+    image::RgbaImage::from_raw(width, height, data).map(image::DynamicImage::ImageRgba8)
 }
 
 fn resolve_image_source(markdown_path: &Path, src: &str) -> Option<ResolvedImageSource> {
@@ -1937,6 +2595,108 @@ fn resolve_image_source(markdown_path: &Path, src: &str) -> Option<ResolvedImage
     }
 }
 
+fn line_plain_text(line: &Line<'_>) -> String {
+    line.spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect::<String>()
+}
+
+fn highlight_lines(
+    lines: &[Line<'static>],
+    regex: &Regex,
+    active_match_line: Option<usize>,
+) -> Vec<Line<'static>> {
+    lines
+        .iter()
+        .enumerate()
+        .map(|(idx, line)| {
+            let line_text = line_plain_text(line);
+            let ranges = regex
+                .find_iter(&line_text)
+                .map(|m| (m.start(), m.end()))
+                .collect::<Vec<_>>();
+            if ranges.is_empty() {
+                return line.clone();
+            }
+
+            let highlight_style = if Some(idx) == active_match_line {
+                Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
+            } else {
+                Style::default().add_modifier(Modifier::REVERSED)
+            };
+
+            apply_highlight_ranges(line, &ranges, highlight_style)
+        })
+        .collect()
+}
+
+fn apply_highlight_ranges(
+    line: &Line<'static>,
+    ranges: &[(usize, usize)],
+    highlight_style: Style,
+) -> Line<'static> {
+    let mut out_spans: Vec<Span<'static>> = Vec::new();
+    let mut range_idx = 0usize;
+    let mut global_offset = 0usize;
+
+    for span in &line.spans {
+        let text = span.content.as_ref();
+        let span_start = global_offset;
+        let span_end = global_offset + text.len();
+        let mut local_cursor = 0usize;
+
+        while range_idx < ranges.len() {
+            let (match_start, match_end) = ranges[range_idx];
+
+            if match_end <= span_start {
+                range_idx += 1;
+                continue;
+            }
+
+            if match_start >= span_end {
+                break;
+            }
+
+            let overlap_start = match_start.max(span_start);
+            let overlap_end = match_end.min(span_end);
+            let overlap_local_start = overlap_start - span_start;
+            let overlap_local_end = overlap_end - span_start;
+
+            if overlap_local_start > local_cursor {
+                out_spans.push(Span::styled(
+                    text[local_cursor..overlap_local_start].to_string(),
+                    span.style,
+                ));
+            }
+
+            if overlap_local_end > overlap_local_start {
+                out_spans.push(Span::styled(
+                    text[overlap_local_start..overlap_local_end].to_string(),
+                    span.style.patch(highlight_style),
+                ));
+                local_cursor = overlap_local_end;
+            }
+
+            if match_end <= span_end {
+                range_idx += 1;
+            } else {
+                break;
+            }
+        }
+
+        if local_cursor < text.len() {
+            out_spans.push(Span::styled(text[local_cursor..].to_string(), span.style));
+        }
+
+        global_offset = span_end;
+    }
+
+    let mut out = line.clone();
+    out.spans = out_spans;
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1957,6 +2717,7 @@ mod tests {
             doc: RenderedDoc {
                 lines: doc_lines,
                 images: Vec::new(),
+                tables: Vec::new(),
             },
             picker: Picker::from_fontsize((8, 16)),
             images: Vec::new(),
@@ -1977,8 +2738,59 @@ mod tests {
             image_resize_tx,
             image_resize_rx,
             virtual_row_count_cache: BTreeMap::new(),
+            image_max_rows: 18,
+            text_image_mode: None,
             highlighted_lines_cache: None,
         }
+    }
+
+    #[test]
+    fn wide_tables_keep_rows_aligned_and_pan_with_cursor() {
+        use ratatui::{backend::TestBackend, widgets::Paragraph};
+        let mut app = test_app(0);
+        app.doc = render_markdown("| Part | Notes |\n|---|---|\n| U1 voltage supply | A very long note about the voltage regulator |\n| C1 | Short |\n\nProse after the table wraps normally.").unwrap();
+        let table = app.doc.tables[0].clone();
+        let width = 20;
+        let mut display = app.build_display_doc(width);
+        assert_eq!(app.virtual_row_for_doc_line(table.end, width), table.end);
+        assert_eq!(
+            display.lines[table.start].width(),
+            display.lines[table.start + 3].width()
+        );
+        app.cursor_row = table.start + 3;
+        for _ in 0..30 {
+            app.move_cursor_right(width);
+        }
+        assert_eq!(app.cursor_column, 30);
+        let offset = app.pan_table(&mut display, width, app.cursor_column);
+        assert_eq!(offset, 11);
+        let mut terminal = Terminal::new(TestBackend::new(width, table.len() as u16)).unwrap();
+        terminal
+            .draw(|frame| {
+                frame.render_widget(
+                    Paragraph::new(viewport_text(
+                        display.lines.clone(),
+                        table.start,
+                        table.len(),
+                    )),
+                    frame.area(),
+                )
+            })
+            .unwrap();
+        // Both data rows retain the same column divider after horizontal clipping.
+        let row1 = line_plain_text(&display.lines[table.start + 3]);
+        let row2 = line_plain_text(&display.lines[table.start + 4]);
+        assert!(row1.contains('│'));
+        assert_eq!(row1.find('│'), row2.find('│'));
+        app.reflow_cursor(width, 30);
+        assert_eq!((app.cursor_row, app.cursor_column), (table.start + 3, 30));
+        app.search("regulator", 10, width);
+        assert_eq!(app.cursor_row, table.start + 3);
+        assert!(app.cursor_column > usize::from(width));
+        let mut display = app.build_display_doc(width);
+        let offset = app.pan_table(&mut display, width, app.cursor_column);
+        assert!(offset > 0);
+        assert!(line_plain_text(&display.lines[app.cursor_row]).ends_with('r'));
     }
 
     fn line_text(line: &Line<'static>) -> String {
@@ -2001,10 +2813,158 @@ mod tests {
             has_encoded_state: false,
             pixel_size: None,
             hinted_pixel_size: Some((160, 160)),
+            source_image: None,
+            fitted_for: None,
+            generation: 0,
+            cell_art: None,
+            text_labels: Vec::new(),
             load_state: ImageLoadState::Loaded,
         }];
         app.image_index_by_line = BTreeMap::from([(8usize, 0usize)]);
         app
+    }
+
+    #[test]
+    fn resize_keeps_cursor_on_the_same_text() {
+        let mut app = test_app(2);
+        app.doc.lines[0] = Line::from("alpha beta gamma delta");
+        app.cursor_row = 1;
+        app.cursor_column = 6;
+        app.scroll = 1;
+        app.reflow_cursor(11, 30);
+        assert_eq!((app.cursor_row, app.cursor_column), (0, 17));
+        app.reflow_cursor(30, 11);
+        assert_eq!((app.cursor_row, app.cursor_column), (1, 6));
+        app.reflow_cursor(11, 0);
+        app.reflow_cursor(0, 11);
+        assert_eq!((app.cursor_row, app.cursor_column), (1, 6));
+    }
+
+    #[test]
+    fn wrapped_rows_drive_scrolling_search_and_selection() {
+        let mut app = test_app(2);
+        app.doc.lines = vec![Line::from("alpha beta gamma delta"), Line::from("last")];
+        let display = app.build_display_doc(11);
+        assert_eq!(
+            display
+                .lines
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            ["alpha beta ", "gamma delta", "last"]
+        );
+        assert_eq!(display.doc_line_for_row, [0, 0, 1]);
+        assert_eq!(app.total_virtual_lines(11), 3);
+        assert_eq!(app.total_virtual_lines(80), 2);
+        app.search("delta", 2, 11);
+        assert_eq!(
+            app.cursor_row, 1,
+            "search must reveal the row containing the match"
+        );
+        app.cursor_column = 4;
+        app.mode = Mode::VisualBlock(CursorPosition { row: 0, column: 0 });
+        assert_eq!(
+            app.visual_selection_text(11).as_deref(),
+            Some("alpha\ngamma")
+        );
+        app.jump_bottom(2, 11);
+        assert_eq!(app.cursor_row, 2);
+        assert_eq!(app.scroll, 1);
+    }
+
+    #[test]
+    fn wrapped_text_does_not_overlap_images() {
+        let mut app = app_with_image_for_navigation();
+        app.doc.lines[0] = Line::from("a".repeat(41));
+        let display = app.build_display_doc(20);
+        let plan = &display.image_plans[0];
+        assert_eq!(plan.start_row, 11);
+        let bounds = app.image_virtual_bounds(20);
+        assert_eq!(bounds[0].start_row, plan.start_row);
+        assert_eq!(bounds[0].end_row, plan.start_row + plan.height);
+        assert_eq!(app.virtual_row_for_doc_line(9, 20), bounds[0].end_row);
+        assert!(display.lines[plan.start_row..plan.start_row + plan.height]
+            .iter()
+            .all(|line| line.spans.is_empty()));
+    }
+
+    #[test]
+    fn word_motion_crosses_wrapped_rows_without_skipping_first_word() {
+        let mut app = test_app(1);
+        app.doc.lines[0] = Line::from("alpha beta gamma");
+        app.cursor_column = 6;
+        app.move_to_next_word(11, WordMotionKind::Small);
+        assert_eq!((app.cursor_row, app.cursor_column), (1, 0));
+        app.move_to_prev_word(11, WordMotionKind::Small);
+        assert_eq!((app.cursor_row, app.cursor_column), (0, 6));
+    }
+
+    #[test]
+    fn cursor_and_selection_respect_grapheme_boundaries() {
+        let mut app = test_app(1);
+        app.doc.lines[0] = Line::from("界e\u{301}👩‍💻!");
+        app.move_cursor_right(80);
+        assert_eq!(app.cursor_column, 2);
+        app.move_cursor_right(80);
+        assert_eq!(app.cursor_column, 3);
+        app.move_cursor_right(80);
+        assert_eq!(app.cursor_column, 5);
+        app.move_cursor_left(80);
+        assert_eq!(app.cursor_column, 3);
+        app.cursor_column = 0;
+        app.mode = Mode::VisualBlock(CursorPosition { row: 0, column: 0 });
+        assert_eq!(app.visual_selection_text(80).as_deref(), Some("界"));
+    }
+
+    #[test]
+    fn ctrl_c_quits_from_normal_search_and_visual_modes() {
+        let mut app = test_app(10);
+        for mode in [
+            Mode::Normal,
+            Mode::SearchInput("query".to_string()),
+            Mode::VisualBlock(CursorPosition { row: 0, column: 0 }),
+        ] {
+            app.mode = mode;
+            assert!(handle_key_event(
+                &mut app,
+                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+                10,
+                80,
+                5,
+                10,
+            ));
+        }
+    }
+
+    #[test]
+    fn local_images_are_detected_by_contents() {
+        let path = std::env::temp_dir().join(format!("mdvi-image-{}.data", std::process::id()));
+        let image = image::DynamicImage::new_rgb8(3, 2);
+        image
+            .save_with_format(&path, image::ImageFormat::Png)
+            .unwrap();
+        let dimensions = probe_local_image_dimensions(&path);
+        let loaded = load_dynamic_image(&ResolvedImageSource::Local(path.clone()), None);
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(dimensions, Some((3, 2)));
+        let loaded = loaded.expect("PNG should load even without a PNG extension");
+        assert_eq!((loaded.width(), loaded.height()), (3, 2));
+    }
+
+    #[test]
+    fn svg_images_are_rasterized() {
+        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="120" height="60" viewBox="0 0 120 60"><rect width="120" height="60" fill="#ff0000"/></svg>"##;
+        for name in ["svg", "data"] {
+            let path = std::env::temp_dir().join(format!("mdvi-svg-{}.{name}", std::process::id()));
+            std::fs::write(&path, svg).unwrap();
+            let dimensions = probe_local_image_dimensions(&path);
+            let loaded = load_dynamic_image(&ResolvedImageSource::Local(path.clone()), None);
+            std::fs::remove_file(path).unwrap();
+            let loaded = loaded.expect("SVG should rasterize").to_rgba8();
+            assert_eq!(dimensions, Some((loaded.width(), loaded.height())));
+            assert_eq!(loaded.width() * 60, loaded.height() * 120);
+            assert_eq!(loaded.get_pixel(1, 1).0, [255, 0, 0, 255]);
+        }
     }
 
     #[test]
@@ -2056,6 +3016,11 @@ mod tests {
             has_encoded_state: false,
             pixel_size: None,
             hinted_pixel_size: None,
+            source_image: None,
+            fitted_for: None,
+            generation: 0,
+            cell_art: None,
+            text_labels: Vec::new(),
             load_state: ImageLoadState::Loading,
         }];
         app.image_index_by_line = BTreeMap::from([(2usize, 0usize)]);
@@ -2068,9 +3033,10 @@ mod tests {
         result_tx
             .send(ImageLoadResult {
                 image_index: 0,
-                payload: ImageLoadResultPayload::LoadedImage(Some(image::DynamicImage::new_rgb8(
-                    320, 200,
-                ))),
+                payload: ImageLoadResultPayload::LoadedImage(
+                    Some(image::DynamicImage::new_rgb8(320, 200)),
+                    Vec::new(),
+                ),
             })
             .expect("image result should enqueue");
 
@@ -2097,6 +3063,11 @@ mod tests {
                 has_encoded_state: false,
                 pixel_size: None,
                 hinted_pixel_size: None,
+                source_image: None,
+                fitted_for: None,
+                generation: 0,
+                cell_art: None,
+                text_labels: Vec::new(),
                 load_state: ImageLoadState::NotRequested,
             },
             InlineImage {
@@ -2113,6 +3084,11 @@ mod tests {
                 has_encoded_state: false,
                 pixel_size: None,
                 hinted_pixel_size: None,
+                source_image: None,
+                fitted_for: None,
+                generation: 0,
+                cell_art: None,
+                text_labels: Vec::new(),
                 load_state: ImageLoadState::NotRequested,
             },
         ];
@@ -2128,7 +3104,7 @@ mod tests {
             ImageLoadJob::ProbeLocalDimensions(path) => {
                 assert_eq!(path, PathBuf::from("/tmp/image-a.png"));
             }
-            ImageLoadJob::LoadImage(_) => panic!("expected dimension probe request"),
+            ImageLoadJob::LoadImage(..) => panic!("expected dimension probe request"),
         }
         assert!(request_rx.try_recv().is_err());
     }
@@ -2152,6 +3128,11 @@ mod tests {
             has_encoded_state: false,
             pixel_size: None,
             hinted_pixel_size: None,
+            source_image: None,
+            fitted_for: None,
+            generation: 0,
+            cell_art: None,
+            text_labels: Vec::new(),
             load_state: ImageLoadState::NotRequested,
         }];
         app.image_loader_tx = image_loader_tx;
@@ -2191,6 +3172,11 @@ mod tests {
                 has_encoded_state: false,
                 pixel_size: None,
                 hinted_pixel_size: None,
+                source_image: None,
+                fitted_for: None,
+                generation: 0,
+                cell_art: None,
+                text_labels: Vec::new(),
                 load_state: ImageLoadState::Loading,
             })
             .collect();
@@ -2201,9 +3187,10 @@ mod tests {
             result_tx
                 .send(ImageLoadResult {
                     image_index,
-                    payload: ImageLoadResultPayload::LoadedImage(Some(
-                        image::DynamicImage::new_rgb8(320, 200),
-                    )),
+                    payload: ImageLoadResultPayload::LoadedImage(
+                        Some(image::DynamicImage::new_rgb8(320, 200)),
+                        Vec::new(),
+                    ),
                 })
                 .expect("image result should enqueue");
         }
@@ -2241,6 +3228,11 @@ mod tests {
             has_encoded_state: false,
             pixel_size: Some((320, 200)),
             hinted_pixel_size: None,
+            source_image: None,
+            fitted_for: None,
+            generation: 0,
+            cell_art: None,
+            text_labels: Vec::new(),
             load_state: ImageLoadState::Loaded,
         }];
         app.image_resize_tx = image_resize_tx;
@@ -2261,6 +3253,108 @@ mod tests {
             .try_recv()
             .expect("resize request should be queued");
         assert_eq!(request.image_index, 0);
+    }
+
+    fn loaded_test_image(app: &App, width: u32, height: u32) -> InlineImage {
+        let source = image::DynamicImage::new_rgb8(width, height);
+        InlineImage {
+            line_index: 0,
+            source: Some(ResolvedImageSource::Remote(
+                "https://example.com/image.png".to_string(),
+            )),
+            state: Some(app.picker.new_resize_protocol(source.clone())),
+            scratch_state: None,
+            active_variant: None,
+            cached_variants: BTreeMap::new(),
+            resize_pending: false,
+            pending_variant: None,
+            has_encoded_state: false,
+            pixel_size: Some((width, height)),
+            hinted_pixel_size: None,
+            source_image: Some(source),
+            fitted_for: None,
+            generation: 1,
+            cell_art: None,
+            text_labels: Vec::new(),
+            load_state: ImageLoadState::Loaded,
+        }
+    }
+
+    #[test]
+    fn window_pixel_report_is_parsed_from_terminal_response() {
+        let response = b"\x1b[4;918;1904t\x1b[?61;1;21;22;28c";
+        assert_eq!(parse_window_pixel_report(response), Some((918, 1904)));
+        assert!(parse_device_attributes_end(response));
+        assert!(!parse_device_attributes_end(b"\x1b[4;918;1904t"));
+        assert_eq!(parse_window_pixel_report(b"\x1b[?62c"), None);
+    }
+
+    #[test]
+    fn fit_image_within_downscales_preserving_aspect_and_never_upscales() {
+        let big = image::DynamicImage::new_rgb8(2240, 1500);
+        let fitted = fit_image_within(&big, 800, 2000);
+        assert_eq!((fitted.width(), fitted.height()), (800, 536));
+        let small = image::DynamicImage::new_rgb8(100, 50);
+        let fitted = fit_image_within(&small, 800, 600);
+        assert_eq!((fitted.width(), fitted.height()), (100, 50));
+    }
+
+    #[test]
+    fn images_are_prefitted_to_their_layout_box() {
+        let mut app = test_app(1);
+        app.images = vec![loaded_test_image(&app, 2240, 1500)];
+        // test picker font is 8x16: 40 cols x 10 rows = 320x160 px box.
+        app.fit_image_to_layout(0, 40, 10);
+        let image = &app.images[0];
+        assert_eq!(image.fitted_for, Some((40, 10)));
+        assert_eq!(image.generation, 2);
+        assert!(image.scratch_state.is_some());
+        let target = image
+            .state
+            .as_ref()
+            .unwrap()
+            .size_for(Resize::Crop(None), Rect::new(0, 0, 200, 200));
+        // 239x160 px rounds up to 30x10 cells; cropping can no longer zoom in.
+        assert_eq!((target.width, target.height), (30, 10));
+    }
+
+    #[test]
+    fn stale_resize_results_are_discarded_after_refit() {
+        let (image_resize_tx, _resize_request_rx) = mpsc::channel::<ImageResizeRequest>();
+        let (resize_result_tx, image_resize_rx) = mpsc::channel::<ImageResizeResult>();
+        let mut app = test_app(1);
+        app.image_resize_tx = image_resize_tx;
+        app.image_resize_rx = image_resize_rx;
+        app.images = vec![loaded_test_image(&app, 640, 400)];
+        app.fit_image_to_layout(0, 40, 10);
+        let stale_protocol = app
+            .picker
+            .new_resize_protocol(image::DynamicImage::new_rgb8(640, 400));
+        resize_result_tx
+            .send(ImageResizeResult {
+                image_index: 0,
+                variant: ImageResizeVariant {
+                    width: 40,
+                    height: 10,
+                    mode: ImageResizeMode::Fit,
+                },
+                protocol: stale_protocol,
+                generation: 1,
+            })
+            .unwrap();
+        assert!(!app.drain_image_resize_results());
+        assert_eq!(app.images[0].active_variant, None);
+    }
+
+    #[test]
+    fn image_row_cap_tracks_viewport_height() {
+        let mut app = test_app(1);
+        app.set_viewport_height(60);
+        assert_eq!(app.image_max_rows, 48);
+        app.set_viewport_height(20);
+        assert_eq!(app.image_max_rows, 18);
+        app.set_viewport_height(10);
+        assert_eq!(app.image_max_rows, 10);
     }
 
     #[test]
@@ -2286,6 +3380,11 @@ mod tests {
             has_encoded_state: true,
             pixel_size: Some((320, 200)),
             hinted_pixel_size: None,
+            source_image: None,
+            fitted_for: None,
+            generation: 0,
+            cell_art: None,
+            text_labels: Vec::new(),
             load_state: ImageLoadState::Loaded,
         }];
         app.image_resize_tx = image_resize_tx;
@@ -2294,6 +3393,7 @@ mod tests {
         resize_result_tx
             .send(ImageResizeResult {
                 image_index: 0,
+                generation: 0,
                 variant: ImageResizeVariant {
                     width: 40,
                     height: 10,
@@ -2343,6 +3443,11 @@ mod tests {
             has_encoded_state: false,
             pixel_size: Some((320, 200)),
             hinted_pixel_size: None,
+            source_image: None,
+            fitted_for: None,
+            generation: 0,
+            cell_art: None,
+            text_labels: Vec::new(),
             load_state: ImageLoadState::Loaded,
         }];
         app.image_resize_tx = image_resize_tx;
@@ -2389,6 +3494,11 @@ mod tests {
             has_encoded_state: true,
             pixel_size: Some((320, 200)),
             hinted_pixel_size: None,
+            source_image: None,
+            fitted_for: None,
+            generation: 0,
+            cell_art: None,
+            text_labels: Vec::new(),
             load_state: ImageLoadState::Loaded,
         }];
         app.image_resize_tx = image_resize_tx;
@@ -2397,6 +3507,7 @@ mod tests {
         resize_result_tx
             .send(ImageResizeResult {
                 image_index: 0,
+                generation: 0,
                 variant: pending_variant,
                 protocol: app
                     .picker
@@ -2586,7 +3697,7 @@ mod tests {
         let viewport_height = 20;
         let full_page = 20;
         let half_page = 10;
-        let cursor_doc_line = app.cursor_doc_line_for_navigation(80);
+        let cursor_doc_line = app.build_display_doc(80).doc_line_for_row[app.cursor_row];
         app.doc.lines[cursor_doc_line] = Line::from("abcdef");
 
         let _ = handle_key_event(
@@ -2626,7 +3737,7 @@ mod tests {
         let viewport_height = 20;
         let full_page = 20;
         let half_page = 10;
-        let cursor_doc_line = app.cursor_doc_line_for_navigation(80);
+        let cursor_doc_line = app.build_display_doc(80).doc_line_for_row[app.cursor_row];
         app.doc.lines[cursor_doc_line] = Line::from("abc");
 
         for _ in 0..10 {
@@ -2641,7 +3752,7 @@ mod tests {
         }
 
         assert_eq!(app.cursor_column, 2);
-        assert_eq!(app.effective_cursor_column_for_line(cursor_doc_line), 2);
+        assert_eq!(app.effective_cursor_column(80), 2);
     }
 
     #[test]
@@ -2740,7 +3851,7 @@ mod tests {
         }
 
         assert_eq!(app.cursor_column, 4);
-        assert_eq!(app.effective_cursor_column_for_line(0), 4);
+        assert_eq!(app.effective_cursor_column(80), 4);
     }
 
     #[test]
@@ -2849,6 +3960,11 @@ mod tests {
             has_encoded_state: false,
             pixel_size: None,
             hinted_pixel_size: Some((1708, 1040)),
+            source_image: None,
+            fitted_for: None,
+            generation: 0,
+            cell_art: None,
+            text_labels: Vec::new(),
             load_state: ImageLoadState::NotRequested,
         };
 
@@ -2872,109 +3988,14 @@ mod tests {
             has_encoded_state: false,
             pixel_size: None,
             hinted_pixel_size: None,
+            source_image: None,
+            fitted_for: None,
+            generation: 0,
+            cell_art: None,
+            text_labels: Vec::new(),
             load_state: ImageLoadState::Failed,
         };
 
         assert_eq!(app.image_height_for(&image, 80), 0);
     }
-}
-
-fn line_plain_text(line: &Line<'_>) -> String {
-    line.spans
-        .iter()
-        .map(|span| span.content.as_ref())
-        .collect::<String>()
-}
-
-fn highlight_lines(
-    lines: &[Line<'static>],
-    regex: &Regex,
-    active_match_line: Option<usize>,
-) -> Vec<Line<'static>> {
-    lines
-        .iter()
-        .enumerate()
-        .map(|(idx, line)| {
-            let line_text = line_plain_text(line);
-            let ranges = regex
-                .find_iter(&line_text)
-                .map(|m| (m.start(), m.end()))
-                .collect::<Vec<_>>();
-            if ranges.is_empty() {
-                return line.clone();
-            }
-
-            let highlight_style = if Some(idx) == active_match_line {
-                Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
-            } else {
-                Style::default().add_modifier(Modifier::REVERSED)
-            };
-
-            apply_highlight_ranges(line, &ranges, highlight_style)
-        })
-        .collect()
-}
-
-fn apply_highlight_ranges(
-    line: &Line<'static>,
-    ranges: &[(usize, usize)],
-    highlight_style: Style,
-) -> Line<'static> {
-    let mut out_spans: Vec<Span<'static>> = Vec::new();
-    let mut range_idx = 0usize;
-    let mut global_offset = 0usize;
-
-    for span in &line.spans {
-        let text = span.content.as_ref();
-        let span_start = global_offset;
-        let span_end = global_offset + text.len();
-        let mut local_cursor = 0usize;
-
-        while range_idx < ranges.len() {
-            let (match_start, match_end) = ranges[range_idx];
-
-            if match_end <= span_start {
-                range_idx += 1;
-                continue;
-            }
-
-            if match_start >= span_end {
-                break;
-            }
-
-            let overlap_start = match_start.max(span_start);
-            let overlap_end = match_end.min(span_end);
-            let overlap_local_start = overlap_start - span_start;
-            let overlap_local_end = overlap_end - span_start;
-
-            if overlap_local_start > local_cursor {
-                out_spans.push(Span::styled(
-                    text[local_cursor..overlap_local_start].to_string(),
-                    span.style,
-                ));
-            }
-
-            if overlap_local_end > overlap_local_start {
-                out_spans.push(Span::styled(
-                    text[overlap_local_start..overlap_local_end].to_string(),
-                    span.style.patch(highlight_style),
-                ));
-                local_cursor = overlap_local_end;
-            }
-
-            if match_end <= span_end {
-                range_idx += 1;
-            } else {
-                break;
-            }
-        }
-
-        if local_cursor < text.len() {
-            out_spans.push(Span::styled(text[local_cursor..].to_string(), span.style));
-        }
-
-        global_offset = span_end;
-    }
-
-    Line::from(out_spans)
 }

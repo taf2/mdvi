@@ -1,4 +1,6 @@
 mod app;
+mod cellart;
+mod layout;
 mod renderer;
 
 use std::path::PathBuf;
@@ -9,6 +11,8 @@ use clap::{Parser, ValueEnum};
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum ImageProtocol {
     Auto,
+    /// Text-mode 2x3 sub-cell rendering (Unicode sextants)
+    Symbols,
     Halfblocks,
     Sixel,
     Kitty,
@@ -29,7 +33,7 @@ struct Cli {
     #[arg(short, long, default_value_t = 1)]
     line: usize,
 
-    /// Image rendering protocol: auto, halfblocks, sixel, kitty, iterm2
+    /// Image rendering protocol: auto, symbols, halfblocks, sixel, kitty, iterm2
     #[arg(long, value_enum, default_value_t = ImageProtocol::Auto)]
     image_protocol: ImageProtocol,
 }

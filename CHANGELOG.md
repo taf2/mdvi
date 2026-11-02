@@ -4,6 +4,39 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- SVG image support (local and remote), rasterized with `resvg`.
+- Text-mode image renderer (`--image-protocol symbols`, default when no graphics protocol is
+  available): per-cell best fit over sextant, quadrant and eighth-block glyphs, with SVG text
+  drawn as real terminal characters.
+- Status bar hint with the `gsettings` command to enable SIXEL in GNOME Terminal.
+
+### Fixed
+- Images were downscaled with nearest-neighbour sampling; they are now pre-fitted with Lanczos.
+- Images were capped at 18 rows; the cap now scales with the viewport height.
+- Partially scrolled images no longer jump to an unscaled crop.
+- Cell pixel size is measured from the window size when the terminal doesn't report it
+  (e.g. VTE), instead of assuming 10x20.
+
+## [0.6.8] - 2026-11-02
+
+### Fixed
+- Kept wide table columns aligned instead of wrapping table rows.
+- Added horizontal table scrolling with cursor movement and revealed search matches in off-screen columns.
+- Preserved table cursor positions on resize and Unicode character alignment when clipping.
+
+## [0.6.7] - 2026-11-02
+
+### Changed
+- Improved word wrapping so scrolling, search, rectangular selection, and inline images stay aligned.
+- Made layout and cursor movement Unicode-aware, including wide characters and emoji.
+- Improved table alignment and header styling, and preserved blank lines and tab spacing in code blocks.
+- Kept the cursor anchored to its text when resizing the terminal.
+
+### Added
+- Makefile commands for building, installing, and checking the project.
+- A rendering showcase and CI checks on Linux and macOS.
+
 ## [0.6.3] - 2026-02-13
 
 ### Changed
