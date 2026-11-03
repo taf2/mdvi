@@ -62,9 +62,16 @@ Requires a current stable Rust toolchain (with Cargo), a C linker, and Make.
 ```bash
 git clone https://github.com/taf2/mdvi.git
 cd mdvi
+./scripts/install-deps.sh  # installs missing build tools and Rust; may use sudo
+export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"
 make            # builds target/release/mdvi
 make install    # installs into Cargo's bin directory (usually ~/.cargo/bin)
 ```
+
+The dependency installer supports Fedora, Debian/Ubuntu, Arch Linux, and macOS
+(via Apple's Command Line Tools). If Make is already available, `make deps`
+runs the same installer. Existing working Rust installations are kept; use
+`rustup update stable` if an older toolchain cannot compile the locked dependencies.
 
 Make sure Cargo's bin directory is on your `PATH`. Without Make, use
 `cargo build --release --locked` to build or `cargo install --locked --path .` to install.

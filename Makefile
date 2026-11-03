@@ -3,7 +3,10 @@
 CARGO ?= cargo
 ARGS ?= README.md
 
-.PHONY: build debug run install test fmt lint check clean help
+.PHONY: build debug run install deps test fmt lint check clean help
+
+deps: ## Install missing build tools and Rust (may invoke sudo)
+	bash scripts/install-deps.sh
 
 build: ## Build the optimized binary in target/release/mdvi
 	$(CARGO) build --release --locked
